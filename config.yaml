@@ -1,0 +1,20 @@
+approval:
+  approval_timeout_hours: 24
+filtering:
+  max_matches_per_run: 10
+  min_message_length: 20
+scraping:
+  active_sources:
+  - hh
+  - linkedin
+  - telegram
+  - remote
+  days_back: 3
+  hh_per_role: 50
+  linkedin_max: 25
+  telegram_folder: 🎯
+  telegram_messages: 50
+telegram_detection:
+  hard_weight: 1.0
+  strong_weight: 1.0
+  weak_weight: 0.4
