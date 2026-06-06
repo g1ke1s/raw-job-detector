@@ -45,6 +45,8 @@ async def scrape_linkedin(max_results: int = 25, location: str = "Almaty, Kazakh
                 r = await client.get(_SEARCH_URL, params=params, timeout=20)
                 if r.status_code != 200:
                     log.warning("LinkedIn %s returned %s", role, r.status_code)
+                    from app.monitoring.events import log_event
+                    await log_event("scrape_error", f"[LINKEDIN] role={role}: HTTP {r.status_code}", "WARNING")
                     continue
 
                 # LinkedIn guest API returns HTML fragments
@@ -87,6 +89,8 @@ async def scrape_linkedin(max_results: int = 25, location: str = "Almaty, Kazakh
                 await asyncio.sleep(2)
             except Exception as e:
                 log.warning("LinkedIn scrape error role=%s: %s", role, e)
+                from app.monitoring.events import log_event
+                await log_event("scrape_error", f"[LINKEDIN] role={role}: {e}", "WARNING")
 
     log.info("LinkedIn total=%d", len(results))
     return results

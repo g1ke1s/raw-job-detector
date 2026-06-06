@@ -72,6 +72,8 @@ async def scrape_hhkz(days_back: int = 1, per_role: int = 50, area: int = 160) -
                 r = await client.get(_SEARCH, params=params, timeout=20)
                 if r.status_code != 200:
                     log.warning("hh.kz %s returned %s", role, r.status_code)
+                    from app.monitoring.events import log_event
+                    await log_event("scrape_error", f"[HH] role={role}: HTTP {r.status_code}", "WARNING")
                     continue
 
                 soup = BeautifulSoup(r.text, "lxml")
@@ -120,6 +122,8 @@ async def scrape_hhkz(days_back: int = 1, per_role: int = 50, area: int = 160) -
                 await asyncio.sleep(1.5)
             except Exception as e:
                 log.warning("hh.kz error role=%s: %s", role, e)
+                from app.monitoring.events import log_event
+                await log_event("scrape_error", f"[HH] role={role}: {e}", "WARNING")
 
     log.info("hh.kz total=%d", len(results))
     return results

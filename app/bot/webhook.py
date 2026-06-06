@@ -477,29 +477,39 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_rejected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
     async with AsyncSessionLocal() as s:
-        matches = (await s.execute(
-            select(Match).where(Match.status == "rejected")
-            .order_by(Match.updated_at.desc()).limit(10)
+        events = (await s.execute(
+            select(EventLog)
+            .where(EventLog.event == "filter_reject")
+            .order_by(EventLog.ts.desc())
+            .limit(20)
         )).scalars().all()
-        if not matches:
-            await update.message.reply_text("No rejected jobs yet.")
-            return
-        lines = ["Last 10 rejected:\n"]
-        for m in matches:
-            dec = await s.scalar(
-                select(Decision).where(Decision.match_id == m.id)
-                .order_by(Decision.decided_at.desc())
-            )
-            reason = (dec.reason or "unknown").replace("_", " ") if dec else "unknown"
-            title = _clean(m.title or "?")
-            company = _clean(m.company or "")
-            date = m.updated_at.strftime("%m-%d %H:%M") if m.updated_at else ""
-            line = f"[{m.source.upper()}] {title}"
-            if company:
-                line += f" @ {company}"
-            line += f"\n  {reason} · {date}"
-            lines.append(line)
-    await update.message.reply_text("\n\n".join(lines))
+    if not events:
+        await update.message.reply_text("No bot-filtered close calls yet.")
+        return
+    lines = [f"Last {len(events)} bot-filtered close calls:\n"]
+    for e in reversed(events):
+        ts = e.ts.strftime("%m-%d %H:%M") if e.ts else ""
+        lines.append(f"{ts}  {e.detail}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_errors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    async with AsyncSessionLocal() as s:
+        events = (await s.execute(
+            select(EventLog)
+            .where(EventLog.level.in_(["WARNING", "ERROR"]))
+            .order_by(EventLog.ts.desc())
+            .limit(20)
+        )).scalars().all()
+    if not events:
+        await update.message.reply_text("No scraper errors recorded.")
+        return
+    lines = [f"Last {len(events)} scraper errors:\n"]
+    for e in reversed(events):
+        ts = e.ts.strftime("%m-%d %H:%M") if e.ts else ""
+        lines.append(f"{ts} [{e.level}] {e.detail}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def _show_jobs(update: Update, source_filter: str | None) -> None:
@@ -607,6 +617,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("covers", cmd_covers))
     app.add_handler(CommandHandler("findall", cmd_findall))
     app.add_handler(CommandHandler("rejected", cmd_rejected))
+    app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("show_hh", cmd_show_hh))
     app.add_handler(CommandHandler("show_tg", cmd_show_tg))

@@ -38,6 +38,8 @@ async def scrape_telegram(days_back: int = 1, messages_per_channel: int = 50) ->
         await client.connect()
         if not await client.is_user_authorized():
             log.error("Telegram session not authorized — re-run generate_session.py")
+            from app.monitoring.events import log_event
+            await log_event("scrape_error", "[TG] session not authorized — re-run generate_session.py", "ERROR")
             return []
 
         # Find folder by name
@@ -80,6 +82,8 @@ async def scrape_telegram(days_back: int = 1, messages_per_channel: int = 50) ->
                 await asyncio.sleep(0.5)
             except Exception as e:
                 log.warning("Telegram channel %s error: %s", channel, e)
+                from app.monitoring.events import log_event
+                await log_event("scrape_error", f"[TG] channel={getattr(channel, 'username', channel)}: {e}", "WARNING")
 
     finally:
         await client.disconnect()

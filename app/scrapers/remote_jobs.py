@@ -72,6 +72,8 @@ async def _scrape_remotive(client: httpx.AsyncClient, roles: list[str]) -> list[
                 })
         except Exception as e:
             log.warning("Remotive error: %s", e)
+            from app.monitoring.events import log_event
+            await log_event("scrape_error", f"[REMOTIVE] role={role}: {e}", "WARNING")
     return results
 
 
@@ -101,6 +103,8 @@ async def _scrape_remoteok(client: httpx.AsyncClient, roles: list[str]) -> list[
             })
     except Exception as e:
         log.warning("RemoteOK error: %s", e)
+        from app.monitoring.events import log_event
+        await log_event("scrape_error", f"[REMOTEOK] {e}", "WARNING")
     return results
 
 
@@ -146,6 +150,8 @@ async def _scrape_wwr(client: httpx.AsyncClient) -> list[dict]:
                 })
         except Exception as e:
             log.warning("WWR error: %s", e)
+            from app.monitoring.events import log_event
+            await log_event("scrape_error", f"[WWR] category={category}: {e}", "WARNING")
     return results
 
 
@@ -176,6 +182,8 @@ async def _scrape_himalayas(client: httpx.AsyncClient, roles: list[str]) -> list
                 })
         except Exception as e:
             log.warning("Himalayas error: %s", e)
+            from app.monitoring.events import log_event
+            await log_event("scrape_error", f"[HIMALAYAS] role={role}: {e}", "WARNING")
     return results
 
 
@@ -235,6 +243,8 @@ async def _scrape_yc(client: httpx.AsyncClient) -> list[dict]:
             break  # only process the most recent valid thread
     except Exception as e:
         log.warning("YC scrape error: %s", e)
+        from app.monitoring.events import log_event
+        await log_event("scrape_error", f"[YC] {e}", "WARNING")
     return results
 
 
@@ -258,6 +268,8 @@ async def scrape_remote_jobs() -> list[dict]:
                 results.extend(batch)
             except Exception as e:
                 log.warning("Remote scraper error: %s", e)
+                from app.monitoring.events import log_event
+                await log_event("scrape_error", f"[REMOTE] {e}", "WARNING")
 
     # Dedup by message_id
     seen: set[str] = set()

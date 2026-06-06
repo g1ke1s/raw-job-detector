@@ -52,6 +52,13 @@ async def classify_telegram_post(text: str, min_length: int = 20) -> list[Classi
                     rule_score=seg.rule_score,
                     reason=f"{seg.reason}|llm_in_field",
                 ))
+            else:
+                from app.monitoring.events import log_event
+                await log_event(
+                    "filter_reject",
+                    f"[tg_llm] {seg.text[:100]} | rule={seg.reason} conf={verdict['confidence']:.2f}",
+                    "INFO",
+                )
     return out
 
 

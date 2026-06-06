@@ -39,6 +39,14 @@ async def title_is_relevant_async(title: str) -> bool:
     has_strong = any(p.search(norm) for _, p in strong)
     has_hard = any(p.search(norm) for _, p in hard)
     is_senior = any(p.search(norm) for _, p in senior)
+    # Log close calls only — jobs that matched the role but were blocked
+    if has_strong:
+        if is_senior:
+            from app.monitoring.events import log_event
+            await log_event("filter_reject", f"[senior] {title}", "INFO")
+        elif has_hard:
+            from app.monitoring.events import log_event
+            await log_event("filter_reject", f"[hard_exclude] {title}", "INFO")
     return has_strong and not has_hard and not is_senior
 
 
