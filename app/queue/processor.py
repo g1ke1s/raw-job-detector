@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.db.session import AsyncSessionLocal
 from app.db.models import AllMessage, Match, RunLog
-from app.dedup.fingerprint import is_duplicate
+from app.dedup.fingerprint import is_duplicate, is_text_duplicate, make_text_fingerprint
 from app.monitoring.events import log_event
 from app.runtime_config import rc
 
@@ -25,6 +25,19 @@ _CONTACT_MARKERS = re.compile(
 )
 
 log = logging.getLogger(__name__)
+
+# Telegram location filter: posts that mention non-KZ cities without any
+# Kazakhstan/Almaty/remote signal are skipped in almaty mode.
+_NON_KZ_CITIES_RE = re.compile(
+    r"\b(москв[аеуио]|московск|питер|санкт.петербург|минск|ташкент|"
+    r"бишкек|новосибирск|екатеринбург|тбилиси|баку|ереван|киев|київ)\b",
+    re.IGNORECASE,
+)
+_KZ_OR_REMOTE_RE = re.compile(
+    r"\b(алматы|almaty|казахстан|kazakhstan|қазақстан|астана|нур.султан|"
+    r"шымкент|remote|удален|дистанц|онлайн)\b",
+    re.IGNORECASE,
+)
 
 _paused = False
 
@@ -85,15 +98,20 @@ def _extract_handle(text: str) -> str | None:
 
     return None
 
-async def run_pipeline(night_run: bool = False) -> dict:
+async def run_pipeline(night_run: bool = False, location_filter: str = "almaty") -> dict:
+    """
+    location_filter: "almaty" — hh.kz area=160, LinkedIn Almaty, Telegram non-KZ skipped
+                     "kz"     — hh.kz area=40 (all KZ), LinkedIn Kazakhstan, all Telegram
+    """
     if _paused:
         return {"error": "Pipeline is paused. Use /resume to continue."}
 
     sources = rc.get("scraping.active_sources") or ["hh", "linkedin", "telegram", "remote"]
     days_back = 2 if night_run else int(rc.get("scraping.days_back") or 1)
-    # No limit on matches — process everything scraped
-    max_matches = 999999
     min_len = int(rc.get("filtering.min_message_length") or 20)
+
+    hh_area = 160 if location_filter == "almaty" else 40
+    linkedin_location = "Almaty, Kazakhstan" if location_filter == "almaty" else "Kazakhstan"
 
     run = RunLog(started_at=datetime.utcnow(), status="running", is_night=night_run)
     async with AsyncSessionLocal() as s:
@@ -112,6 +130,7 @@ async def run_pipeline(night_run: bool = False) -> dict:
             jobs = await scrape_hhkz(
                 days_back=days_back,
                 per_role=int(rc.get("scraping.hh_per_role") or 50),
+                area=hh_area,
             )
             all_jobs.extend(jobs)
             per_source["hh"] = len(jobs)
@@ -121,6 +140,7 @@ async def run_pipeline(night_run: bool = False) -> dict:
             from app.scrapers.linkedin import scrape_linkedin
             jobs = await scrape_linkedin(
                 max_results=int(rc.get("scraping.linkedin_max") or 25),
+                location=linkedin_location,
             )
             all_jobs.extend(jobs)
             per_source["linkedin"] = len(jobs)
@@ -170,11 +190,17 @@ async def run_pipeline(night_run: bool = False) -> dict:
 
             if source == "telegram":
                 raw_text = item.get("raw_text", "")
+                # Location filter: skip posts that mention non-KZ cities
+                # without any Kazakhstan/Almaty/remote signal
+                if location_filter == "almaty":
+                    if _NON_KZ_CITIES_RE.search(raw_text) and not _KZ_OR_REMOTE_RE.search(raw_text):
+                        continue
                 from app.scrapers.telegram_classify import classify_telegram_post
                 vacancies = await classify_telegram_post(raw_text, min_length=min_len)
                 for vac in vacancies:
                     company = item.get("channel", "telegram")
-                    if await is_duplicate(company, vac.role or vac.text[:40], source):
+                        # Text-based dedup: same vacancy in different channels → same fingerprint
+                    if await is_text_duplicate(vac.text, source):
                         continue
                     if "llm" in vac.reason:
                         llm_calls += 1
@@ -189,7 +215,11 @@ async def run_pipeline(night_run: bool = False) -> dict:
                         low_conf=vac.low_conf,
                         recruiter_handle=handle,
                         night_run=night_run,
-                        extra={"channel": item.get("channel"), "reason": vac.reason},
+                        extra={
+                            "channel": item.get("channel"),
+                            "reason": vac.reason,
+                            "pub_date": item.get("pub_date"),
+                        },
                     )
                     enqueued += 1
             else:
@@ -204,7 +234,7 @@ async def run_pipeline(night_run: bool = False) -> dict:
                     rule_score=1.0, low_conf=False,
                     recruiter_handle=None,
                     night_run=night_run,
-                    extra={},
+                    extra={"pub_date": item.get("pub_date")},
                 )
                 enqueued += 1
 

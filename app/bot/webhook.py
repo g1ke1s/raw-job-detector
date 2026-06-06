@@ -75,14 +75,15 @@ async def _logs_text() -> str:
     )
 
 
-async def _run_pipeline_and_report(bot, msg_id: int) -> None:
+async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "almaty") -> None:
     from app.queue.processor import run_pipeline
-    result = await run_pipeline()
+    result = await run_pipeline(location_filter=location_filter)
     if "error" in result:
         text = f"Pipeline error:\n{result['error']}"
     else:
+        loc_tag = "" if location_filter == "almaty" else f" [{location_filter.upper()}]"
         text = (
-            f"Done.\n"
+            f"Done{loc_tag}.\n"
             f"Scraped: {result['scraped']}\n"
             f"Enqueued: {result['enqueued']}\n"
             f"LLM calls: {result['llm_calls']}"
@@ -99,8 +100,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
-    msg = await update.message.reply_text("Starting pipeline...")
-    asyncio.create_task(_run_pipeline_and_report(ctx.bot, msg.message_id))
+    msg = await update.message.reply_text("Starting pipeline... (Almaty)")
+    asyncio.create_task(_run_pipeline_and_report(ctx.bot, msg.message_id, location_filter="almaty"))
+
+
+async def cmd_findall(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    msg = await update.message.reply_text("Starting pipeline... (all KZ)")
+    asyncio.create_task(_run_pipeline_and_report(ctx.bot, msg.message_id, location_filter="kz"))
 
 
 async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -448,8 +455,8 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     elif data == "cfg_noop":
         pass
     elif data == "cmd_find":
-        await query.edit_message_text("Starting pipeline...")
-        asyncio.create_task(_run_pipeline_and_report(ctx.bot, query.message.message_id))
+        await query.edit_message_text("Starting pipeline... (Almaty)")
+        asyncio.create_task(_run_pipeline_and_report(ctx.bot, query.message.message_id, location_filter="almaty"))
     elif data == "cmd_health":
         await query.edit_message_text(_health_text(), reply_markup=main_menu_keyboard())
     elif data == "cmd_queue":
@@ -465,6 +472,34 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await query.edit_message_text(await _logs_text(), reply_markup=main_menu_keyboard())
     elif data == "cmd_back":
         await query.edit_message_text("Job Agent online.", reply_markup=main_menu_keyboard())
+
+
+async def cmd_rejected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    async with AsyncSessionLocal() as s:
+        matches = (await s.execute(
+            select(Match).where(Match.status == "rejected")
+            .order_by(Match.updated_at.desc()).limit(10)
+        )).scalars().all()
+        if not matches:
+            await update.message.reply_text("No rejected jobs yet.")
+            return
+        lines = ["Last 10 rejected:\n"]
+        for m in matches:
+            dec = await s.scalar(
+                select(Decision).where(Decision.match_id == m.id)
+                .order_by(Decision.decided_at.desc())
+            )
+            reason = (dec.reason or "unknown").replace("_", " ") if dec else "unknown"
+            title = _clean(m.title or "?")
+            company = _clean(m.company or "")
+            date = m.updated_at.strftime("%m-%d %H:%M") if m.updated_at else ""
+            line = f"[{m.source.upper()}] {title}"
+            if company:
+                line += f" @ {company}"
+            line += f"\n  {reason} · {date}"
+            lines.append(line)
+    await update.message.reply_text("\n\n".join(lines))
 
 
 async def _show_jobs(update: Update, source_filter: str | None) -> None:
@@ -570,6 +605,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("setcover", cmd_setcover))
     app.add_handler(CommandHandler("covers", cmd_covers))
+    app.add_handler(CommandHandler("findall", cmd_findall))
+    app.add_handler(CommandHandler("rejected", cmd_rejected))
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("show_hh", cmd_show_hh))
     app.add_handler(CommandHandler("show_tg", cmd_show_tg))

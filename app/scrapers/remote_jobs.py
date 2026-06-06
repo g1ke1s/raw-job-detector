@@ -6,13 +6,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
 
 from app.scrapers.remote_filter import job_passes_remote_filter
+
+
+def _epoch_to_date(epoch) -> Optional[str]:
+    try:
+        return datetime.fromtimestamp(int(epoch), tz=timezone.utc).strftime("%d.%m.%Y")
+    except Exception:
+        return None
+
+
+def _iso_to_date(s: str) -> Optional[str]:
+    try:
+        return datetime.fromisoformat(str(s)[:10]).strftime("%d.%m.%Y")
+    except Exception:
+        return None
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +68,7 @@ async def _scrape_remotive(client: httpx.AsyncClient, roles: list[str]) -> list[
                     "company": j.get("company_name", ""),
                     "url": j.get("url", ""),
                     "description": _strip_html(j.get("description", ""))[:500],
+                    "pub_date": _iso_to_date(j.get("publication_date", "")),
                 })
         except Exception as e:
             log.warning("Remotive error: %s", e)
@@ -82,6 +97,7 @@ async def _scrape_remoteok(client: httpx.AsyncClient, roles: list[str]) -> list[
                 "company": j.get("company", ""),
                 "url": j.get("url", ""),
                 "description": _strip_html(j.get("description", ""))[:500],
+                "pub_date": _epoch_to_date(j.get("date")),
             })
     except Exception as e:
         log.warning("RemoteOK error: %s", e)
@@ -111,6 +127,14 @@ async def _scrape_wwr(client: httpx.AsyncClient) -> list[dict]:
                 link = item.find("link")
                 guid = item.find("guid")
                 company_el = item.find("company")
+                pub_el = item.find("pubDate")
+                wwr_date = None
+                if pub_el:
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        wwr_date = parsedate_to_datetime(pub_el.get_text(strip=True)).strftime("%d.%m.%Y")
+                    except Exception:
+                        pass
                 results.append({
                     "source": "remote_wwr",
                     "message_id": f"wwr_{guid.get_text() if guid else title[:40]}",
@@ -118,6 +142,7 @@ async def _scrape_wwr(client: httpx.AsyncClient) -> list[dict]:
                     "company": company_el.get_text(strip=True) if company_el else "",
                     "url": link.get_text(strip=True) if link else "",
                     "description": title,
+                    "pub_date": wwr_date,
                 })
         except Exception as e:
             log.warning("WWR error: %s", e)
@@ -147,6 +172,7 @@ async def _scrape_himalayas(client: httpx.AsyncClient, roles: list[str]) -> list
                     "company": j.get("companyName", ""),
                     "url": j.get("applicationLink") or j.get("url", ""),
                     "description": _strip_html(j.get("description", ""))[:500],
+                    "pub_date": _iso_to_date(j.get("createdAt") or j.get("postedAt") or ""),
                 })
         except Exception as e:
             log.warning("Himalayas error: %s", e)
@@ -201,6 +227,7 @@ async def _scrape_yc(client: httpx.AsyncClient) -> list[dict]:
                         "company": "",
                         "url": f"https://news.ycombinator.com/item?id={kid}",
                         "description": _strip_html(text)[:500],
+                        "pub_date": _epoch_to_date(comment.get("time")),
                     })
                     await asyncio.sleep(0.1)
                 except Exception:

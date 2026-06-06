@@ -89,11 +89,13 @@ async def _send_gate1_card(match: Match) -> int:
     low_conf_tag = " ⚠️ LOW CONF" if match.low_conf else ""
     handle_tag = f" | {match.recruiter_handle}" if match.recruiter_handle else ""
     source_tag = match.source.upper()
+    pub_date = (match.extra or {}).get("pub_date")
+    date_tag = f"\nDate: {pub_date}" if pub_date else ""
 
     text = (
         f"[{source_tag}{low_conf_tag}]{handle_tag}\n"
         f"{_clean(match.title or 'Unknown role')}\n"
-        f"{_clean(match.company or '')}\n\n"
+        f"{_clean(match.company or '')}{date_tag}\n\n"
         f"{_clean(match.description or '')[:400]}\n\n"
         f"Score: {match.rule_score:.2f}"
     )

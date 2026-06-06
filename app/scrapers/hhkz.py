@@ -51,7 +51,7 @@ def _parse_date(s: str) -> Optional[datetime]:
     return None
 
 
-async def scrape_hhkz(days_back: int = 1, per_role: int = 50) -> list[dict]:
+async def scrape_hhkz(days_back: int = 1, per_role: int = 50, area: int = 160) -> list[dict]:
     from app.db.config_store import get as db_get
     roles = await db_get("roles") or ["Data Scientist", "ML Engineer"]
     cutoff = datetime.utcnow() - timedelta(days=days_back)
@@ -64,7 +64,7 @@ async def scrape_hhkz(days_back: int = 1, per_role: int = 50) -> list[dict]:
             try:
                 params = {
                     "text": role,
-                    "area": 160,
+                    "area": area,
                     "search_field": "name",
                     "per_page": min(per_role, 100),
                     "order_by": "publication_time",
@@ -112,6 +112,7 @@ async def scrape_hhkz(days_back: int = 1, per_role: int = 50) -> list[dict]:
                             "url": url if url.startswith("http") else f"{_BASE}{url}",
                             "salary": salary,
                             "description": f"{title} at {company}. {salary}",
+                            "pub_date": pub_date.strftime("%d.%m.%Y") if pub_date else None,
                         })
                     except Exception as e:
                         log.debug("hh.kz card error: %s", e)

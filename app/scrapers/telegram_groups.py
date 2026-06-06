@@ -75,6 +75,7 @@ async def scrape_telegram(days_back: int = 1, messages_per_channel: int = 50) ->
                         "url": f"https://t.me/{getattr(channel, 'username', channel.id)}/{message.id}",
                         "channel": getattr(channel, "username", str(channel.id)),
                         "date": message.date.isoformat(),
+                        "pub_date": message.date.strftime("%d.%m.%Y"),
                     })
                 await asyncio.sleep(0.5)
             except Exception as e:

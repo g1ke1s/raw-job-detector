@@ -10,7 +10,9 @@ async def main():
     bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"])
     commands = [
         BotCommand("start", "Show menu"),
-        BotCommand("find", "Run job search pipeline"),
+        BotCommand("find", "Search jobs in Almaty"),
+        BotCommand("findall", "Search jobs across all Kazakhstan"),
+        BotCommand("rejected", "Show last 10 rejected jobs"),
         BotCommand("show", "Send next waiting job (any source)"),
         BotCommand("show_hh", "Send next waiting hh.kz job"),
         BotCommand("show_tg", "Send next waiting Telegram job"),

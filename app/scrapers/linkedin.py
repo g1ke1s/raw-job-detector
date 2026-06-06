@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from app.scrapers.structured_filter import title_is_relevant
+from app.scrapers.structured_filter import title_is_relevant_async
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ _HEADERS = {
 }
 
 
-async def scrape_linkedin(max_results: int = 25) -> list[dict]:
+async def scrape_linkedin(max_results: int = 25, location: str = "Almaty, Kazakhstan") -> list[dict]:
     from app.db.config_store import get as db_get
     roles = await db_get("roles") or ["Data Scientist"]
     results: list[dict] = []
@@ -37,7 +37,7 @@ async def scrape_linkedin(max_results: int = 25) -> list[dict]:
             try:
                 params = {
                     "keywords": role,
-                    "location": "Kazakhstan",
+                    "location": location,
                     "f_TPR": "r86400",      # last 24h
                     "start": 0,
                     "count": 10,
@@ -60,7 +60,7 @@ async def scrape_linkedin(max_results: int = 25) -> list[dict]:
                         if not title_el:
                             continue
                         title = title_el.get_text(strip=True)
-                        if not title_is_relevant(title):
+                        if not await title_is_relevant_async(title):
                             continue
 
                         link_el = card.select_one("a.base-card__full-link")
