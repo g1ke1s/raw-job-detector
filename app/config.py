@@ -18,6 +18,12 @@ class Settings(BaseSettings):
 
     database_url: str
 
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_bcc: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"

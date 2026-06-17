@@ -1,23 +1,6 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-SKIP_REASONS = [
-    ("Not relevant", "not_relevant"),
-    ("Too junior", "too_junior"),
-    ("Too senior", "too_senior"),
-    ("Wrong location", "wrong_location"),
-    ("Already applied", "already_applied"),
-]
-
 ALL_SOURCES = ["hh", "linkedin", "telegram", "remote"]
-
-
-def skip_reason_keyboard(match_id: int) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(label, callback_data=f"g1_reason_{match_id}_{key}")]
-        for label, key in SKIP_REASONS
-    ]
-    buttons.append([InlineKeyboardButton("Cancel", callback_data=f"g1_cancel_{match_id}")])
-    return InlineKeyboardMarkup(buttons)
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:

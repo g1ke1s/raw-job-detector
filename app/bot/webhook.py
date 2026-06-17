@@ -17,7 +17,7 @@ from app.config import settings
 from app.db.session import AsyncSessionLocal
 from app.db.models import Match, Decision, RunLog, EventLog
 from app.bot.keyboards import (
-    skip_reason_keyboard, main_menu_keyboard,
+    main_menu_keyboard,
     settings_keyboard, ALL_SOURCES,
 )
 from app.monitoring.events import log_event
@@ -276,6 +276,7 @@ async def _handle_approve(query, match_id: int) -> None:
         slug = match_role_slug(title)
         template = await get_template(slug) if slug else None
         url_line = f"\n{url}" if url else ""
+        is_email = "@" not in handle[:1]  # email has no leading @
 
         if not template:
             available = [s for s, _ in await get_all_templates()]
@@ -284,7 +285,7 @@ async def _handle_approve(query, match_id: int) -> None:
                 f"Approved: {title}\n"
                 f"Contact: {handle}{url_line}\n\n"
                 f"No template for role '{slug or 'unknown'}'.\n{hint}\n\n"
-                f"Use /setcover to add one, or contact {handle} manually."
+                f"Use /setcover to add one, then contact {handle} manually."
             )
             return
 
@@ -293,8 +294,10 @@ async def _handle_approve(query, match_id: int) -> None:
             match = await s.get(Match, match_id)
             match.cover_text = filled
             match.status = "cover_pending"
+            match.updated_at = datetime.utcnow()
             await s.commit()
 
+        channel_label = f"email to {handle}" if is_email else f"DM to {handle}"
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Send", callback_data=f"cover_send_{match_id}"),
@@ -302,7 +305,7 @@ async def _handle_approve(query, match_id: int) -> None:
             InlineKeyboardButton("❌ Discard", callback_data=f"cover_discard_{match_id}"),
         ]])
         await query.edit_message_text(
-            f"Cover letter for {handle}{url_line}:\n\n{filled}",
+            f"Cover letter ({channel_label}){url_line}:\n\n{filled}",
             reply_markup=kb,
         )
         return
@@ -320,8 +323,8 @@ async def _handle_skip(query, match_id: int, reason: str) -> None:
         match.updated_at = datetime.utcnow()
         s.add(Decision(match_id=match_id, verdict="rejected", reason=reason))
         await s.commit()
-    await query.edit_message_text(f"Skipped: {reason.replace('_', ' ')}")
-    await log_event("gate1_skipped", f"match_id={match_id} reason={reason}")
+    await query.edit_message_text("Skipped.")
+    await log_event("gate1_skipped", f"match_id={match_id}")
 
 
 async def _handle_cover_send(query, match_id: int) -> None:
@@ -332,12 +335,19 @@ async def _handle_cover_send(query, match_id: int) -> None:
             return
         cover = match.cover_text or ""
         handle = match.recruiter_handle or ""
+        title = _clean(match.title or "")
         match.status = "applied"
         match.updated_at = datetime.utcnow()
         await s.commit()
 
-    from app.appliers.tg_sender import send_dm
-    ok = await send_dm(handle, cover)
+    is_email = handle and not handle.startswith("@")
+    if is_email:
+        from app.appliers.email_sender import send_email
+        ok = await send_email(handle, f"Job application: {title}", cover)
+    else:
+        from app.appliers.tg_sender import send_dm
+        ok = await send_dm(handle, cover)
+
     if ok:
         await query.edit_message_text(f"Sent to {handle}.")
         await log_event("cover_sent", f"match_id={match_id} handle={handle}")
@@ -411,18 +421,7 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if data.startswith("g1_approve_"):
         await _handle_approve(query, int(data.split("_")[-1]))
     elif data.startswith("g1_skip_"):
-        match_id = int(data.split("_")[-1])
-        await query.edit_message_reply_markup(reply_markup=skip_reason_keyboard(match_id))
-    elif data.startswith("g1_reason_"):
-        parts = data.split("_")
-        await _handle_skip(query, int(parts[2]), "_".join(parts[3:]))
-    elif data.startswith("g1_cancel_"):
-        match_id = int(data.split("_")[-1])
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"g1_approve_{match_id}"),
-            InlineKeyboardButton("❌ Skip", callback_data=f"g1_skip_{match_id}"),
-        ]]))
+        await _handle_skip(query, int(data.split("_")[-1]), "skipped")
     elif data.startswith("cover_send_"):
         await _handle_cover_send(query, int(data.split("_")[-1]))
     elif data.startswith("cover_edit_"):
@@ -475,21 +474,22 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_rejected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows last 20 system-rejected close calls: filter drops + dedup drops."""
     if not _authorized(update): return
     async with AsyncSessionLocal() as s:
         events = (await s.execute(
             select(EventLog)
-            .where(EventLog.event == "filter_reject")
+            .where(EventLog.event.in_(["filter_reject", "dedup_drop"]))
             .order_by(EventLog.ts.desc())
             .limit(20)
         )).scalars().all()
     if not events:
-        await update.message.reply_text("No bot-filtered close calls yet.")
+        await update.message.reply_text("No system-rejected jobs yet.")
         return
-    lines = [f"Last {len(events)} bot-filtered close calls:\n"]
+    lines = [f"Last {len(events)} system-rejected:\n"]
     for e in reversed(events):
         ts = e.ts.strftime("%m-%d %H:%M") if e.ts else ""
-        lines.append(f"{ts}  {e.detail}")
+        lines.append(f"{ts} [{e.event}] {e.detail}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -588,6 +588,85 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Pipeline resumed.")
 
 
+async def cmd_seniors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show jobs tagged as senior-level (stored but not auto-sent)."""
+    if not _authorized(update): return
+    async with AsyncSessionLocal() as s:
+        matches = (await s.execute(
+            select(Match)
+            .where(Match.seniority == "senior")
+            .order_by(Match.created_at.desc())
+            .limit(20)
+        )).scalars().all()
+    if not matches:
+        await update.message.reply_text("No senior-tagged jobs yet.")
+        return
+    lines = [f"Last {len(matches)} senior-level roles (hidden from auto-queue):\n"]
+    for m in matches:
+        pub_date = (m.extra or {}).get("pub_date", "")
+        line = f"[{m.source.upper()}] {_clean(m.title or '?')}"
+        if m.company:
+            line += f" @ {_clean(m.company)}"
+        if pub_date:
+            line += f" | {pub_date}"
+        if m.url:
+            line += f"\n{m.url}"
+        lines.append(line)
+    text = "\n\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n...(truncated)"
+    await update.message.reply_text(text)
+
+
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export all matches + decisions as CSV file."""
+    if not _authorized(update): return
+    import csv
+    import io
+    async with AsyncSessionLocal() as s:
+        matches = (await s.execute(
+            select(Match).order_by(Match.created_at.desc()).limit(1000)
+        )).scalars().all()
+        decisions_rows = (await s.execute(select(Decision))).scalars().all()
+    decisions = {d.match_id: d for d in decisions_rows}
+
+    rows = []
+    for m in matches:
+        dec = decisions.get(m.id)
+        if m.status == "applied":
+            status_label = "applied"
+        elif dec and dec.verdict == "rejected" and dec.reason == "skipped":
+            status_label = "rejected_user"
+        elif m.status == "rejected":
+            status_label = "rejected_user" if dec else "rejected_system"
+        elif m.seniority == "senior":
+            status_label = "senior_hidden"
+        else:
+            status_label = m.status
+        rows.append({
+            "date": m.created_at.strftime("%Y-%m-%d") if m.created_at else "",
+            "title": m.title or "",
+            "company": m.company or "",
+            "source": m.source or "",
+            "score": round(m.rule_score or 0, 2),
+            "seniority": m.seniority or "",
+            "status": status_label,
+            "url": m.url or "",
+            "pub_date": (m.extra or {}).get("pub_date", ""),
+        })
+
+    output = io.StringIO()
+    if rows:
+        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    bio = io.BytesIO(output.getvalue().encode("utf-8"))
+    bio.name = "jobs_export.csv"
+    await update.message.reply_document(document=bio, filename="jobs_export.csv",
+                                        caption=f"{len(rows)} jobs exported.")
+
+
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
     import os
@@ -618,6 +697,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("findall", cmd_findall))
     app.add_handler(CommandHandler("rejected", cmd_rejected))
     app.add_handler(CommandHandler("errors", cmd_errors))
+    app.add_handler(CommandHandler("seniors", cmd_seniors))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("show_hh", cmd_show_hh))
     app.add_handler(CommandHandler("show_tg", cmd_show_tg))

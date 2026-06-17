@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from app.scrapers.structured_filter import title_is_relevant_async
+from app.scrapers.structured_filter import title_seniority_check
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +62,8 @@ async def scrape_linkedin(max_results: int = 25, location: str = "Almaty, Kazakh
                         if not title_el:
                             continue
                         title = title_el.get_text(strip=True)
-                        if not await title_is_relevant_async(title):
+                        check = await title_seniority_check(title)
+                        if check == "drop":
                             continue
 
                         link_el = card.select_one("a.base-card__full-link")
@@ -82,6 +83,7 @@ async def scrape_linkedin(max_results: int = 25, location: str = "Almaty, Kazakh
                             "company": company,
                             "url": url,
                             "description": f"{title} at {company}",
+                            "seniority": "senior" if check == "senior" else None,
                         })
                     except Exception as e:
                         log.debug("LinkedIn card error: %s", e)

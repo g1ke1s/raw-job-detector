@@ -1,6 +1,6 @@
 """
 Rule-based title filter for hh.kz and LinkedIn.
-Keywords loaded from DB. Senior/lead titles are dropped.
+Keywords loaded from DB. Senior-level titles are tagged, not dropped.
 """
 from __future__ import annotations
 
@@ -28,9 +28,15 @@ def _compile(terms: list[str]):
     return out
 
 
-async def title_is_relevant_async(title: str) -> bool:
+async def title_seniority_check(title: str) -> str:
+    """
+    Returns:
+      "pass"   — in-field, not senior → enqueue normally
+      "senior" — in-field, senior level → tag and store, skip auto-queue
+      "drop"   — not in-field or hard-excluded → discard
+    """
     if not title or len(title.strip()) < 3:
-        return False
+        return "drop"
     norm = _norm(title)
     from app.db.config_store import get as db_get
     strong = _compile(await db_get("include_strong") or [])
@@ -39,19 +45,23 @@ async def title_is_relevant_async(title: str) -> bool:
     has_strong = any(p.search(norm) for _, p in strong)
     has_hard = any(p.search(norm) for _, p in hard)
     is_senior = any(p.search(norm) for _, p in senior)
-    # Log close calls only — jobs that matched the role but were blocked
-    if has_strong:
-        if is_senior:
-            from app.monitoring.events import log_event
-            await log_event("filter_reject", f"[senior] {title}", "INFO")
-        elif has_hard:
+
+    if not has_strong or has_hard:
+        if has_strong and has_hard:
             from app.monitoring.events import log_event
             await log_event("filter_reject", f"[hard_exclude] {title}", "INFO")
-    return has_strong and not has_hard and not is_senior
+        return "drop"
+    if is_senior:
+        return "senior"
+    return "pass"
+
+
+async def title_is_relevant_async(title: str) -> bool:
+    return await title_seniority_check(title) == "pass"
 
 
 def title_is_relevant(title: str) -> bool:
-    """Sync fallback using hardcoded defaults."""
+    """Sync fallback using hardcoded defaults (no seniority tagging)."""
     if not title or len(title.strip()) < 3:
         return False
     from app.scrapers._tg_defaults import DEFAULTS

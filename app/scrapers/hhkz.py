@@ -10,7 +10,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.runtime_config import rc
-from app.scrapers.structured_filter import title_is_relevant_async
+from app.scrapers.structured_filter import title_seniority_check
 
 log = logging.getLogger(__name__)
 
@@ -91,7 +91,8 @@ async def scrape_hhkz(days_back: int = 1, per_role: int = 50, area: int = 160) -
 
                         if job_id in seen_ids:
                             continue
-                        if not await title_is_relevant_async(title):
+                        check = await title_seniority_check(title)
+                        if check == "drop":
                             continue
 
                         company_el = card.select_one("[data-qa='vacancy-serp__vacancy-employer']")
@@ -115,6 +116,7 @@ async def scrape_hhkz(days_back: int = 1, per_role: int = 50, area: int = 160) -
                             "salary": salary,
                             "description": f"{title} at {company}. {salary}",
                             "pub_date": pub_date.strftime("%d.%m.%Y") if pub_date else None,
+                            "seniority": "senior" if check == "senior" else None,
                         })
                     except Exception as e:
                         log.debug("hh.kz card error: %s", e)

@@ -199,8 +199,9 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
                 vacancies = await classify_telegram_post(raw_text, min_length=min_len)
                 for vac in vacancies:
                     company = item.get("channel", "telegram")
-                        # Text-based dedup: same vacancy in different channels → same fingerprint
+                    # Text-based dedup: same vacancy in different channels → same fingerprint
                     if await is_text_duplicate(vac.text, source):
+                        await log_event("dedup_drop", f"[tg] {vac.text[:80]}", "INFO")
                         continue
                     if "llm" in vac.reason:
                         llm_calls += 1
@@ -215,6 +216,8 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
                         low_conf=vac.low_conf,
                         recruiter_handle=handle,
                         night_run=night_run,
+                        seniority=None,
+                        job_json=item,
                         extra={
                             "channel": item.get("channel"),
                             "reason": vac.reason,
@@ -226,6 +229,7 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
                 title = item.get("title", "")
                 company = item.get("company", "")
                 if await is_duplicate(company, title, source):
+                    await log_event("dedup_drop", f"[{source}] {title} @ {company}", "INFO")
                     continue
                 await _enqueue(
                     source=source, title=title, company=company,
@@ -234,6 +238,8 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
                     rule_score=1.0, low_conf=False,
                     recruiter_handle=None,
                     night_run=night_run,
+                    seniority=item.get("seniority"),
+                    job_json=item,
                     extra={"pub_date": item.get("pub_date")},
                 )
                 enqueued += 1
@@ -270,7 +276,7 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
 
 async def _enqueue(
     source, title, company, url, description,
-    rule_score, low_conf, recruiter_handle, night_run, extra,
+    rule_score, low_conf, recruiter_handle, night_run, seniority, job_json, extra,
 ) -> None:
     async with AsyncSessionLocal() as s:
         s.add(Match(
@@ -280,6 +286,8 @@ async def _enqueue(
             status="waiting",
             recruiter_handle=recruiter_handle,
             night_run=night_run,
+            seniority=seniority,
+            job_json=job_json,
             extra=extra,
         ))
         await s.commit()

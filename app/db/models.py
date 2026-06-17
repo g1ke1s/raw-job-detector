@@ -48,6 +48,8 @@ class Match(Base):
     recruiter_handle = Column(String(128))
     cover_text = Column(Text)
     night_run = Column(Boolean, default=False)
+    seniority = Column(String(32), nullable=True)
+    job_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     extra = Column(JSON, default=dict)

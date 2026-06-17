@@ -57,10 +57,12 @@ async def _tick() -> None:
             return
 
         # Only auto-send non-night jobs
+        # Only auto-send non-night, non-senior jobs
         next_match = await s.scalar(
             select(Match).where(
                 Match.status == "waiting",
                 Match.night_run == False,
+                Match.seniority.is_(None),
             ).order_by(Match.created_at)
         )
         if not next_match:

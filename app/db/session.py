@@ -17,6 +17,16 @@ async def get_session() -> AsyncSession:
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Idempotent column migrations for existing databases
+        from sqlalchemy import text
+        for stmt in [
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS seniority VARCHAR(32)",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS job_json JSONB",
+        ]:
+            try:
+                await conn.execute(text(stmt))
+            except Exception as e:
+                log.warning("Migration skipped: %s", e)
     log.info("Database tables verified/created")
     from app.db.config_store import seed_defaults
     await seed_defaults()
