@@ -32,6 +32,8 @@ async def main():
         BotCommand("covers", "List saved cover templates"),
         BotCommand("stop", "Pause the pipeline"),
         BotCommand("resume", "Resume the pipeline"),
+        BotCommand("cv", "CV status and tailoring"),
+        BotCommand("help", "Show all commands"),
     ]
     await bot.set_my_commands(commands)
     print("Bot commands registered.")

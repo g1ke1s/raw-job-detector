@@ -22,6 +22,8 @@ async def init_db() -> None:
         for stmt in [
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS seniority VARCHAR(32)",
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS job_json JSONB",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS fit_assessment_json JSONB",
+            "ALTER TABLE matches ADD COLUMN IF NOT EXISTS cv_tailor_json JSONB",
         ]:
             try:
                 await conn.execute(text(stmt))

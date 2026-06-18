@@ -106,6 +106,7 @@ async def _send_gate1_card(match: Match) -> int:
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"g1_approve_{match.id}"),
+        InlineKeyboardButton("🚀 Boost", callback_data=f"g1_boost_{match.id}"),
         InlineKeyboardButton("❌ Skip", callback_data=f"g1_skip_{match.id}"),
     ]])
 

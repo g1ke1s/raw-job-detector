@@ -50,6 +50,8 @@ class Match(Base):
     night_run = Column(Boolean, default=False)
     seniority = Column(String(32), nullable=True)
     job_json = Column(JSON, nullable=True)
+    fit_assessment_json = Column(JSON, nullable=True)
+    cv_tailor_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     extra = Column(JSON, default=dict)
@@ -106,3 +108,14 @@ class AppConfig(Base):
     key = Column(String(64), unique=True, nullable=False)
     value = Column(Text, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Profile(Base):
+    __tablename__ = "profiles"
+
+    id = Column(Integer, primary_key=True)
+    version = Column(Integer, nullable=False, default=1)
+    is_active = Column(Boolean, default=True, nullable=False)
+    raw_cv_text = Column(Text)
+    structured_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
