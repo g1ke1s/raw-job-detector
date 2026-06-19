@@ -32,15 +32,45 @@ _SYSTEM = (
 
 
 def _extract_text(pdf_bytes: bytes) -> str:
+    """Try fitz → pdfminer → pypdf in order; fitz handles LaTeX/CM fonts best."""
+    # 1. pymupdf (fitz) — best for LaTeX-generated PDFs
     try:
-        import pypdf
+        import fitz  # pymupdf
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = [page.get_text() for page in doc]
+        text = "\n".join(pages).strip()
+        if text and len(text) > 50:
+            log.info("PDF extracted via fitz (%d chars)", len(text))
+            return text
+    except Exception as e:
+        log.warning("fitz extraction failed: %s", e)
+
+    # 2. pdfminer.six — good fallback for complex encodings
+    try:
         import io
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        text = pdfminer_extract(io.BytesIO(pdf_bytes)).strip()
+        if text and len(text) > 50:
+            log.info("PDF extracted via pdfminer (%d chars)", len(text))
+            return text
+    except Exception as e:
+        log.warning("pdfminer extraction failed: %s", e)
+
+    # 3. pypdf — last resort
+    try:
+        import io
+        import pypdf
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
         pages = [page.extract_text() or "" for page in reader.pages]
-        return "\n".join(pages).strip()
+        text = "\n".join(pages).strip()
+        if text and len(text) > 50:
+            log.info("PDF extracted via pypdf (%d chars)", len(text))
+            return text
     except Exception as e:
-        log.error("PDF text extraction failed: %s", e)
-        return ""
+        log.warning("pypdf extraction failed: %s", e)
+
+    log.error("All PDF extraction methods failed")
+    return ""
 
 
 def _fix_bullet_ids(structured: dict) -> dict:
@@ -60,7 +90,10 @@ async def ingest_pdf(pdf_bytes: bytes) -> tuple[bool, str]:
     """
     raw_text = _extract_text(pdf_bytes)
     if not raw_text or len(raw_text) < 50:
-        return False, "Could not extract text from PDF. Is it a text-based PDF (not scanned)?"
+        return False, (
+            "Could not extract text from PDF.\n"
+            "Try: /setcv followed by pasting your CV as plain text."
+        )
 
     messages = [
         {"role": "system", "content": _SYSTEM},

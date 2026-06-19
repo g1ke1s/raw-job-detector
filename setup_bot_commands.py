@@ -1,4 +1,3 @@
-"""Run once to register bot command menu with Telegram."""
 import asyncio
 import os
 from dotenv import load_dotenv
@@ -33,6 +32,7 @@ async def main():
         BotCommand("stop", "Pause the pipeline"),
         BotCommand("resume", "Resume the pipeline"),
         BotCommand("cv", "CV status and tailoring"),
+        BotCommand("setcv", "Paste CV as plain text (if PDF fails)"),
         BotCommand("help", "Show all commands"),
     ]
     await bot.set_my_commands(commands)

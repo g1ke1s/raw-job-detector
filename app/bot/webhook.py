@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 _pending_edit: dict[int, int] = {}
 _app = None
 
+# Imported lazily to avoid circular import at module load; used in handle_message for /setcv
+from app.cv.ingest import _SYSTEM as _SYSTEM_CV_PARSE
+
 
 def _authorized(update: Update) -> bool:
     uid = None
@@ -447,6 +450,39 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not _authorized(update):
         return
     user_id = update.message.from_user.id
+
+    if user_id in _pending_cv_text:
+        _pending_cv_text.discard(user_id)
+        raw_text = (update.message.text or "").strip()
+        if len(raw_text) < 50:
+            await update.message.reply_text("Text too short. Try again with /setcv.")
+            return
+        msg = await update.message.reply_text("Parsing CV text...")
+        from app.cv.ingest import _fix_bullet_ids, _store_profile
+        from app.llm.client import complete
+        from app.llm.parsing import safe_json_parse
+        messages = [
+            {"role": "system", "content": _SYSTEM_CV_PARSE},
+            {"role": "user", "content": f"CV text:\n\"\"\"\n{raw_text[:6000]}\n\"\"\""},
+        ]
+        raw = await complete(messages, max_tokens=2000, purpose="cv_parse")
+        if not raw:
+            await msg.edit_text("LLM unavailable. Try again.")
+            return
+        structured = safe_json_parse(raw)
+        if not structured or not isinstance(structured, dict):
+            await msg.edit_text("CV parsing failed (bad LLM output). Try again.")
+            return
+        structured = _fix_bullet_ids(structured)
+        await _store_profile(raw_text, structured)
+        name = structured.get("name") or "Unknown"
+        await msg.edit_text(
+            f"CV saved for {name}.\n"
+            f"{len(structured.get('experiences', []))} experience entries, "
+            f"{len(structured.get('skills', []))} skills."
+        )
+        return
+
     if user_id not in _pending_edit:
         return
 
@@ -560,6 +596,19 @@ async def _handle_boost_tailor(query, match_id: int) -> None:
     except Exception as e:
         log.error("boost_tailor error for match %d: %s", match_id, e)
         await query.edit_message_text(f"Error during tailoring: {e}")
+
+
+_pending_cv_text: set[int] = set()
+
+
+async def cmd_setcv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enter CV text-paste mode — next message is treated as raw CV text."""
+    if not _authorized(update): return
+    _pending_cv_text.add(settings.telegram_chat_id)
+    await update.message.reply_text(
+        "Paste your CV as plain text in the next message.\n"
+        "I'll parse it immediately."
+    )
 
 
 async def cmd_cv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -877,6 +926,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("cv", cmd_cv))
+    app.add_handler(CommandHandler("setcv", cmd_setcv))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(gate1_callback))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf_upload))
