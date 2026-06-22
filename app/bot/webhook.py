@@ -16,19 +16,16 @@ from sqlalchemy import select, func
 from app.config import settings
 from app.db.session import AsyncSessionLocal
 from app.db.models import Match, Decision, RunLog, EventLog
-from app.bot.keyboards import (
-    main_menu_keyboard,
-    settings_keyboard, ALL_SOURCES,
-)
+from app.bot.keyboards import main_menu_keyboard, settings_keyboard, ALL_SOURCES
 from app.monitoring.events import log_event
 from app.runtime_config import rc
 
 log = logging.getLogger(__name__)
 
-_pending_edit: dict[int, int] = {}
+_pending_cv_text: set[int] = set()
 _app = None
 
-# Imported lazily to avoid circular import at module load; used in handle_message for /setcv
+# Imported at module level — used in handle_message for /setcv text paste
 from app.cv.ingest import _SYSTEM as _SYSTEM_CV_PARSE
 
 
@@ -97,6 +94,14 @@ async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "alm
     )
 
 
+def _notify_dispatcher() -> None:
+    """Kick the dispatcher to check the queue immediately after a decision."""
+    from app.queue.dispatcher import notify_decision
+    notify_decision()
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
     await update.message.reply_text("Job Agent online.", reply_markup=main_menu_keyboard())
@@ -130,7 +135,6 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )).scalars().all()
         approved = await s.scalar(select(func.count()).select_from(Decision).where(Decision.verdict == "approved"))
         rejected = await s.scalar(select(func.count()).select_from(Decision).where(Decision.verdict == "rejected"))
-        # Night run stats
         night_total = await s.scalar(
             select(func.count()).select_from(Match).where(Match.night_run == True)
         )
@@ -144,7 +148,6 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 Match.night_run == True, Match.status == "approved"
             )
         )
-        # Per-source breakdown
         from sqlalchemy import text
         src_rows = (await s.execute(
             text("SELECT source, count(*) FROM matches GROUP BY source")
@@ -152,12 +155,11 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = [
         f"Decisions: {approved} approved, {rejected} skipped",
-        f"\nNight run queue: {night_total} total | {night_waiting} waiting | {night_approved} approved",
+        f"\nNight run: {night_total} total | {night_waiting} waiting | {night_approved} approved",
         "\nBy source:",
     ]
     for src, cnt in src_rows:
         lines.append(f"  {src}: {cnt}")
-
     lines.append("\nLast 5 runs:")
     for r in runs:
         dur = f" ({int((r.finished_at-r.started_at).total_seconds())}s)" if r.finished_at and r.started_at else ""
@@ -210,74 +212,11 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Error: {e}")
 
 
-async def cmd_setcover(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    args = ctx.args
-    if not args or len(args) < 2:
-        await update.message.reply_text(
-            "Usage: /setcover <role_slug> <template>\n\n"
-            "Placeholders: {company} {role_title}\n\n"
-            "Example:\n"
-            "/setcover da Здравствуйте! Меня заинтересовала вакансия "
-            "{role_title} в {company}..."
-        )
-        return
-    slug = args[0].lower().strip()
-    template = " ".join(args[1:]).strip()
-    if not template:
-        await update.message.reply_text("Template cannot be empty.")
-        return
-    from app.appliers.cover import save_template
-    await save_template(slug, template)
-    preview = template[:200] + ("..." if len(template) > 200 else "")
-    await update.message.reply_text(f"Saved template for: {slug}\n\nPreview:\n{preview}")
-
-
-async def cmd_covers(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    from app.appliers.cover import get_all_templates
-    templates = await get_all_templates()
-    if not templates:
-        await update.message.reply_text("No templates yet. Use /setcover <role> <text>")
-        return
-    lines = ["Cover templates:\n"]
-    for slug, tmpl in templates:
-        preview = tmpl[:120] + ("..." if len(tmpl) > 120 else "")
-        lines.append(f"[{slug}]\n{preview}\n")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def _auto_send_next() -> None:
-    """Immediately dispatch the next waiting job after a Gate 1 decision."""
-    if _app is None:
-        return
-    from app.queue.dispatcher import send_card_direct
-    async with AsyncSessionLocal() as s:
-        in_flight = await s.scalar(select(Match).where(Match.status == "sent_to_user"))
-        if in_flight:
-            return
-        next_match = await s.scalar(
-            select(Match).where(
-                Match.status == "waiting",
-                Match.night_run == False,
-                Match.seniority.is_(None),
-            ).order_by(Match.created_at)
-        )
-        if not next_match:
-            return
-        try:
-            msg_id = await send_card_direct(next_match)
-            next_match.status = "sent_to_user"
-            next_match.telegram_message_id = msg_id
-            next_match.updated_at = datetime.utcnow()
-            await s.commit()
-        except Exception as e:
-            log.error("auto_send_next failed: %s", e)
-
+# ── Gate 1 handlers ───────────────────────────────────────────────────────────
 
 async def _run_apply_downstream(query, match_id: int, source: str, title: str,
                                 company: str, url: str, handle: str | None) -> None:
-    """Shared downstream logic after approve or boost decision."""
+    """Common downstream logic after Approve or Boost sets a match to approved."""
     if source == "hh" and url:
         await query.edit_message_text("Approved. Fetching details...")
         from app.scrapers.hh_detail import fetch_hh_details, format_hh_details
@@ -286,52 +225,18 @@ async def _run_apply_downstream(query, match_id: int, source: str, title: str,
             await query.edit_message_text(format_hh_details(details, title, url))
         else:
             await query.edit_message_text(f"Approved: {title}\n{url}\n(Could not fetch details)")
-        asyncio.create_task(_auto_send_next())
+        _notify_dispatcher()
         return
 
     if source == "telegram" and handle:
-        from app.appliers.cover import match_role_slug, get_template, fill_template, get_all_templates
-        slug = match_role_slug(title)
-        template = await get_template(slug) if slug else None
         url_line = f"\n{url}" if url else ""
-        is_email = "@" not in handle[:1]
-
-        if not template:
-            available = [s for s, _ in await get_all_templates()]
-            hint = f"Available slugs: {', '.join(available)}" if available else "No templates saved yet."
-            await query.edit_message_text(
-                f"Approved: {title}\n"
-                f"Contact: {handle}{url_line}\n\n"
-                f"No template for role '{slug or 'unknown'}'.\n{hint}\n\n"
-                f"Use /setcover to add one, then contact {handle} manually."
-            )
-            asyncio.create_task(_auto_send_next())
-            return
-
-        filled = fill_template(template, company, title)
-        async with AsyncSessionLocal() as s:
-            match = await s.get(Match, match_id)
-            match.cover_text = filled
-            match.status = "cover_pending"
-            match.updated_at = datetime.utcnow()
-            await s.commit()
-
-        channel_label = f"email to {handle}" if is_email else f"DM to {handle}"
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Send", callback_data=f"cover_send_{match_id}"),
-            InlineKeyboardButton("✏️ Edit", callback_data=f"cover_edit_{match_id}"),
-            InlineKeyboardButton("❌ Discard", callback_data=f"cover_discard_{match_id}"),
-        ]])
-        await query.edit_message_text(
-            f"Cover letter ({channel_label}){url_line}:\n\n{filled}",
-            reply_markup=kb,
-        )
-        # cover_pending: user still deciding, do NOT auto-advance yet
+        channel = f"Email: {handle}" if not handle.startswith("@") else f"Contact: {handle}"
+        await query.edit_message_text(f"Approved — {channel}{url_line}")
+        _notify_dispatcher()
         return
 
     await query.edit_message_text(f"Approved: {title}\n{url}")
-    asyncio.create_task(_auto_send_next())
+    _notify_dispatcher()
 
 
 async def _handle_approve(query, match_id: int) -> None:
@@ -372,9 +277,10 @@ async def _handle_boost(query, match_id: int) -> None:
 
     await log_event("gate1_boosted", f"match_id={match_id} source={source}")
 
-    # Fire-and-forget fit assessment in background
+    # Two background LLM tasks — fire-and-forget, never block the Gate 1 response
     if _app:
         asyncio.create_task(_send_fit_assessment(match_id, title))
+        asyncio.create_task(_send_cover_letter(match_id, title, company))
 
     await _run_apply_downstream(query, match_id, source, title, company, url, handle)
 
@@ -386,10 +292,23 @@ async def _send_fit_assessment(match_id: int, job_title: str) -> None:
         if text and _app:
             await _app.bot.send_message(
                 chat_id=settings.telegram_chat_id,
-                text=f"Fit assessment for [{job_title}]:\n\n{text}",
+                text=f"Fit assessment [{job_title}]:\n\n{text}",
             )
     except Exception as e:
         log.error("Fit assessment failed for match %d: %s", match_id, e)
+
+
+async def _send_cover_letter(match_id: int, job_title: str, company: str) -> None:
+    from app.cv.cover import generate_cover
+    try:
+        letter = await generate_cover(match_id)
+        if letter and _app:
+            await _app.bot.send_message(
+                chat_id=settings.telegram_chat_id,
+                text=f"Cover letter [{job_title} @ {company}]:\n\n{letter}",
+            )
+    except Exception as e:
+        log.error("Cover letter generation failed for match %d: %s", match_id, e)
 
 
 async def _handle_skip(query, match_id: int, reason: str) -> None:
@@ -404,64 +323,10 @@ async def _handle_skip(query, match_id: int, reason: str) -> None:
         await s.commit()
     await query.edit_message_text("Skipped.")
     await log_event("gate1_skipped", f"match_id={match_id}")
-    asyncio.create_task(_auto_send_next())
+    _notify_dispatcher()
 
 
-async def _handle_cover_send(query, match_id: int) -> None:
-    async with AsyncSessionLocal() as s:
-        match = await s.get(Match, match_id)
-        if not match:
-            await query.edit_message_text("Match not found.")
-            return
-        cover = match.cover_text or ""
-        handle = match.recruiter_handle or ""
-        title = _clean(match.title or "")
-        match.status = "applied"
-        match.updated_at = datetime.utcnow()
-        await s.commit()
-
-    is_email = handle and not handle.startswith("@")
-    if is_email:
-        from app.appliers.email_sender import send_email
-        ok = await send_email(handle, f"Job application: {title}", cover)
-    else:
-        from app.appliers.tg_sender import send_dm
-        ok = await send_dm(handle, cover)
-
-    if ok:
-        await query.edit_message_text(f"Sent to {handle}.")
-        await log_event("cover_sent", f"match_id={match_id} handle={handle}")
-    else:
-        await query.edit_message_text(f"Failed to send to {handle}. Send manually:\n\n{cover}")
-    asyncio.create_task(_auto_send_next())
-
-
-async def _handle_cover_edit(query, match_id: int) -> None:
-    async with AsyncSessionLocal() as s:
-        match = await s.get(Match, match_id)
-        if not match:
-            await query.edit_message_text("Match not found.")
-            return
-        match.status = "cover_edit_pending"
-        await s.commit()
-
-    _pending_edit[settings.telegram_chat_id] = match_id
-    await query.edit_message_text("Send your edited cover letter. I'll forward it as-is.")
-
-
-async def _handle_cover_discard(query, match_id: int) -> None:
-    async with AsyncSessionLocal() as s:
-        match = await s.get(Match, match_id)
-        if not match:
-            await query.edit_message_text("Match not found.")
-            return
-        match.status = "rejected"
-        match.updated_at = datetime.utcnow()
-        s.add(Decision(match_id=match_id, verdict="rejected", reason="cover_discarded"))
-        await s.commit()
-    await query.edit_message_text("Cover discarded.")
-    asyncio.create_task(_auto_send_next())
-
+# ── CV upload / text-paste handlers ──────────────────────────────────────────
 
 async def handle_pdf_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
@@ -516,35 +381,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             f"{len(structured.get('experiences', []))} experience entries, "
             f"{len(structured.get('skills', []))} skills."
         )
-        return
 
-    if user_id not in _pending_edit:
-        return
 
-    match_id = _pending_edit.pop(user_id)
-    edited_text = update.message.text or ""
-
-    async with AsyncSessionLocal() as s:
-        match = await s.get(Match, match_id)
-        if not match:
-            await update.message.reply_text("Match not found.")
-            return
-        match.cover_text = edited_text
-        handle = match.recruiter_handle or ""
-        await s.commit()
-
-    from app.appliers.tg_sender import send_dm
-    ok = await send_dm(handle, edited_text)
-    if ok:
-        async with AsyncSessionLocal() as s:
-            match = await s.get(Match, match_id)
-            match.status = "applied"
-            await s.commit()
-        await update.message.reply_text(f"Sent to {handle}.")
-        await log_event("cover_sent_edited", f"match_id={match_id} handle={handle}")
-    else:
-        await update.message.reply_text(f"Failed to send to {handle}. Send manually:\n\n{edited_text}")
-
+# ── Callback router ───────────────────────────────────────────────────────────
 
 async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -559,12 +398,6 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await _handle_skip(query, int(data.split("_")[-1]), "skipped")
     elif data.startswith("boost_tailor_"):
         await _handle_boost_tailor(query, int(data.split("_")[-1]))
-    elif data.startswith("cover_send_"):
-        await _handle_cover_send(query, int(data.split("_")[-1]))
-    elif data.startswith("cover_edit_"):
-        await _handle_cover_edit(query, int(data.split("_")[-1]))
-    elif data.startswith("cover_discard_"):
-        await _handle_cover_discard(query, int(data.split("_")[-1]))
     elif data.startswith("cfg_src_"):
         src = data[8:]
         current, days, max_m = _settings_state()
@@ -610,118 +443,9 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await query.edit_message_text("Job Agent online.", reply_markup=main_menu_keyboard())
 
 
-async def _handle_boost_tailor(query, match_id: int) -> None:
-    await query.edit_message_text("Tailoring CV... this may take a moment.")
-    try:
-        from app.cv.tailor import tailor_and_render
-        pdf_bytes, status = await tailor_and_render(match_id)
-        if pdf_bytes:
-            import io
-            bio = io.BytesIO(pdf_bytes)
-            bio.name = f"cv_tailored_{match_id}.pdf"
-            await _app.bot.send_document(
-                chat_id=settings.telegram_chat_id,
-                document=bio,
-                filename=f"cv_tailored_{match_id}.pdf",
-                caption=status,
-            )
-            await query.edit_message_text("Tailored CV sent as PDF.")
-        else:
-            await query.edit_message_text(f"Tailoring failed: {status}")
-    except Exception as e:
-        log.error("boost_tailor error for match %d: %s", match_id, e)
-        await query.edit_message_text(f"Error during tailoring: {e}")
-
-
-_pending_cv_text: set[int] = set()
-
-
-async def cmd_setcv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Enter CV text-paste mode — next message is treated as raw CV text."""
-    if not _authorized(update): return
-    _pending_cv_text.add(settings.telegram_chat_id)
-    await update.message.reply_text(
-        "Paste your CV as plain text in the next message.\n"
-        "I'll parse it immediately."
-    )
-
-
-async def cmd_cv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show CV status and offer tailor option for last boosted match."""
-    if not _authorized(update): return
-    from app.cv.ingest import get_active_profile
-    profile = await get_active_profile()
-    if not profile:
-        await update.message.reply_text(
-            "No CV on file.\n\nSend me a PDF of your CV and I'll parse it automatically."
-        )
-        return
-    cv = profile.structured_json or {}
-    name = cv.get("name", "Unknown")
-    exp_count = len(cv.get("experiences", []))
-    skill_count = len(cv.get("skills", []))
-    lines = [
-        f"CV v{profile.version} — {name}",
-        f"{exp_count} experience entries, {skill_count} skills",
-        f"Uploaded: {profile.created_at.strftime('%Y-%m-%d %H:%M') if profile.created_at else '?'}",
-        "\nSend a new PDF to replace.",
-    ]
-
-    # Offer tailor for the most recent boosted match
-    async with AsyncSessionLocal() as s:
-        from sqlalchemy import text as sql_text
-        last_boosted = await s.scalar(
-            select(Match)
-            .join(Decision, Decision.match_id == Match.id)
-            .where(Decision.reason == "boost")
-            .order_by(Match.updated_at.desc())
-        )
-    if last_boosted:
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                f"🔧 Tailor CV for: {(last_boosted.title or '')[:40]}",
-                callback_data=f"boost_tailor_{last_boosted.id}",
-            )
-        ]])
-        await update.message.reply_text("\n".join(lines), reply_markup=kb)
-    else:
-        await update.message.reply_text("\n".join(lines))
-
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    text = (
-        "Job Agent commands:\n\n"
-        "/find — scrape jobs in Almaty\n"
-        "/findall — scrape jobs across all KZ\n"
-        "/show — send next waiting job\n"
-        "/show_hh /show_tg /show_linkedin /show_remote — by source\n"
-        "/queue — pending count\n"
-        "/stats — pipeline statistics\n"
-        "/seniors — senior-tagged jobs (not auto-sent)\n"
-        "/rejected — system-rejected close calls\n"
-        "/errors — scraper errors\n"
-        "/export — download matches as CSV\n"
-        "/cv — CV status + tailoring\n"
-        "/setcover <slug> <text> — save cover letter template\n"
-        "/covers — list templates\n"
-        "/settings — toggle sources/days/max\n"
-        "/set <key> <value> — edit config\n"
-        "/config — show config.yaml\n"
-        "/health — LLM provider status\n"
-        "/logs — recent events\n"
-        "/stop /resume — pause/resume pipeline\n\n"
-        "Gate 1 buttons:\n"
-        "✅ Approve — send cover/show details\n"
-        "🚀 Boost — approve + run LLM fit assessment\n"
-        "❌ Skip — reject immediately"
-    )
-    await update.message.reply_text(text)
-
+# ── Information commands ──────────────────────────────────────────────────────
 
 async def cmd_rejected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shows last 20 system-rejected close calls: filter drops + dedup drops."""
     if not _authorized(update): return
     async with AsyncSessionLocal() as s:
         events = (await s.execute(
@@ -759,30 +483,24 @@ async def cmd_errors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
-async def _show_jobs(update: Update, source_filter: str | None) -> None:
+async def cmd_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
     from app.queue.dispatcher import send_card_direct
 
     async with AsyncSessionLocal() as s:
-        q = select(Match).where(Match.status == "waiting")
-        cq = select(func.count()).select_from(Match).where(Match.status == "waiting")
-        if source_filter == "remote":
-            q = q.where(Match.source.like("remote%"))
-            cq = cq.where(Match.source.like("remote%"))
-        elif source_filter:
-            q = q.where(Match.source == source_filter)
-            cq = cq.where(Match.source == source_filter)
-        total = await s.scalar(cq)
-        next_match = await s.scalar(q.order_by(Match.created_at))
+        total = await s.scalar(select(func.count()).select_from(Match).where(Match.status == "waiting"))
+        next_match = await s.scalar(
+            select(Match).where(Match.status == "waiting").order_by(Match.created_at)
+        )
 
-    label = source_filter or "any"
     if not next_match:
-        await update.message.reply_text(f"No waiting jobs [{label}].")
+        await update.message.reply_text("No waiting jobs.")
         return
 
     try:
         msg_id = await send_card_direct(next_match)
     except Exception as e:
-        log.error("show_jobs send error: %s", e)
+        log.error("show send error: %s", e)
         await update.message.reply_text(f"Error sending job: {e}")
         return
 
@@ -793,50 +511,10 @@ async def _show_jobs(update: Update, source_filter: str | None) -> None:
         m.updated_at = datetime.utcnow()
         await s.commit()
 
-    await update.message.reply_text(f"Sent. {max(0, total - 1)} more waiting [{label}].")
-
-
-async def cmd_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    await _show_jobs(update, None)
-
-
-async def cmd_show_hh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    await _show_jobs(update, "hh")
-
-
-async def cmd_show_tg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    await _show_jobs(update, "telegram")
-
-
-async def cmd_show_linkedin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    await _show_jobs(update, "linkedin")
-
-
-async def cmd_show_remote(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    await _show_jobs(update, "remote")
-
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    from app.queue.processor import set_paused
-    set_paused(True)
-    await update.message.reply_text("Pipeline paused. Use /resume to continue.")
-
-
-async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    from app.queue.processor import set_paused
-    set_paused(False)
-    await update.message.reply_text("Pipeline resumed.")
+    await update.message.reply_text(f"Sent. {max(0, total - 1)} more waiting.")
 
 
 async def cmd_seniors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show jobs tagged as senior-level (stored but not auto-sent)."""
     if not _authorized(update): return
     async with AsyncSessionLocal() as s:
         matches = (await s.execute(
@@ -866,10 +544,8 @@ async def cmd_seniors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Export all matches + decisions as CSV file."""
     if not _authorized(update): return
-    import csv
-    import io
+    import csv, io
     async with AsyncSessionLocal() as s:
         matches = (await s.execute(
             select(Match).order_by(Match.created_at.desc()).limit(1000)
@@ -917,6 +593,20 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                                         caption=f"{len(rows)} jobs exported.")
 
 
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    from app.queue.processor import set_paused
+    set_paused(True)
+    await update.message.reply_text("Pipeline paused. Use /resume to continue.")
+
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    from app.queue.processor import set_paused
+    set_paused(False)
+    await update.message.reply_text("Pipeline resumed.")
+
+
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
     import os
@@ -926,12 +616,120 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         with open(path) as f:
             text = f.read()
-        await update.message.reply_text(
-            f"<pre>{html.escape(text)}</pre>", parse_mode="HTML"
-        )
+        await update.message.reply_text(f"<pre>{html.escape(text)}</pre>", parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"Config error: {e}")
 
+
+# ── CV commands ───────────────────────────────────────────────────────────────
+
+async def _handle_boost_tailor(query, match_id: int) -> None:
+    await query.edit_message_text("Tailoring CV... this may take a moment.")
+    try:
+        from app.cv.tailor import tailor_and_render
+        pdf_bytes, status = await tailor_and_render(match_id)
+        if pdf_bytes:
+            import io
+            bio = io.BytesIO(pdf_bytes)
+            bio.name = f"cv_tailored_{match_id}.pdf"
+            await _app.bot.send_document(
+                chat_id=settings.telegram_chat_id,
+                document=bio,
+                filename=f"cv_tailored_{match_id}.pdf",
+                caption=status,
+            )
+            await query.edit_message_text("Tailored CV sent as PDF.")
+        else:
+            await query.edit_message_text(f"Tailoring failed: {status}")
+    except Exception as e:
+        log.error("boost_tailor error for match %d: %s", match_id, e)
+        await query.edit_message_text(f"Error during tailoring: {e}")
+
+
+async def cmd_setcv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    _pending_cv_text.add(settings.telegram_chat_id)
+    await update.message.reply_text(
+        "Paste your CV as plain text in the next message.\n"
+        "I'll parse it immediately."
+    )
+
+
+async def cmd_cv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    from app.cv.ingest import get_active_profile
+    profile = await get_active_profile()
+    if not profile:
+        await update.message.reply_text(
+            "No CV on file.\n\nSend me a PDF of your CV and I'll parse it automatically."
+        )
+        return
+    cv = profile.structured_json or {}
+    name = cv.get("name", "Unknown")
+    lines = [
+        f"CV v{profile.version} — {name}",
+        f"{len(cv.get('experiences', []))} experience entries, {len(cv.get('skills', []))} skills",
+        f"Uploaded: {profile.created_at.strftime('%Y-%m-%d %H:%M') if profile.created_at else '?'}",
+        "\nSend a new PDF to replace.",
+    ]
+
+    async with AsyncSessionLocal() as s:
+        last_boosted = await s.scalar(
+            select(Match)
+            .join(Decision, Decision.match_id == Match.id)
+            .where(Decision.reason == "boost")
+            .order_by(Match.updated_at.desc())
+        )
+    if last_boosted:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"🔧 Tailor CV for: {(last_boosted.title or '')[:40]}",
+                callback_data=f"boost_tailor_{last_boosted.id}",
+            )
+        ]])
+        await update.message.reply_text("\n".join(lines), reply_markup=kb)
+    else:
+        await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    text = (
+        "Job Agent commands\n\n"
+        "Search\n"
+        "/find — scrape Almaty (hh.kz + LinkedIn + Telegram + YC)\n"
+        "/findall — scrape all Kazakhstan\n"
+        "/show — manually send next waiting job\n\n"
+        "Queue\n"
+        "/queue — waiting / in-flight count\n"
+        "/seniors — senior-tagged jobs (not auto-sent)\n"
+        "/rejected — system-rejected close calls\n"
+        "/export — download all matches as CSV\n\n"
+        "CV\n"
+        "/cv — CV status + tailor button\n"
+        "/setcv — paste CV as plain text (if PDF fails)\n\n"
+        "Config\n"
+        "/settings — toggle sources / days / max\n"
+        "/set <key> <value> — edit runtime config\n"
+        "/config — show config.yaml\n\n"
+        "Monitoring\n"
+        "/stats — pipeline statistics\n"
+        "/health — LLM provider status\n"
+        "/logs — recent events\n"
+        "/errors — scraper errors\n\n"
+        "Pipeline\n"
+        "/stop — pause\n"
+        "/resume — unpause\n\n"
+        "Gate 1 buttons\n"
+        "Approve — mark approved, show details, auto-advance\n"
+        "Boost — approve + fit assessment + cover letter (2 LLM calls)\n"
+        "Skip — reject immediately, auto-advance"
+    )
+    await update.message.reply_text(text)
+
+
+# ── Handler registration ──────────────────────────────────────────────────────
 
 def register_handlers(app: Application) -> None:
     global _app
@@ -939,24 +737,18 @@ def register_handlers(app: Application) -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("find", cmd_find))
+    app.add_handler(CommandHandler("findall", cmd_findall))
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
-    app.add_handler(CommandHandler("setcover", cmd_setcover))
-    app.add_handler(CommandHandler("covers", cmd_covers))
-    app.add_handler(CommandHandler("findall", cmd_findall))
+    app.add_handler(CommandHandler("show", cmd_show))
     app.add_handler(CommandHandler("rejected", cmd_rejected))
     app.add_handler(CommandHandler("errors", cmd_errors))
     app.add_handler(CommandHandler("seniors", cmd_seniors))
     app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("show", cmd_show))
-    app.add_handler(CommandHandler("show_hh", cmd_show_hh))
-    app.add_handler(CommandHandler("show_tg", cmd_show_tg))
-    app.add_handler(CommandHandler("show_linkedin", cmd_show_linkedin))
-    app.add_handler(CommandHandler("show_remote", cmd_show_remote))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("config", cmd_config))

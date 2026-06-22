@@ -12,6 +12,7 @@ from app.runtime_config import rc
 
 log = logging.getLogger(__name__)
 _bot_app = None
+_decision_event: asyncio.Event | None = None
 
 
 def set_bot(app) -> None:
@@ -19,14 +20,28 @@ def set_bot(app) -> None:
     _bot_app = app
 
 
+def notify_decision() -> None:
+    """Wake the dispatch loop immediately after a Gate 1 decision resolves a match."""
+    global _decision_event
+    if _decision_event is not None:
+        _decision_event.set()
+
+
 async def dispatch_loop() -> None:
+    global _decision_event
+    _decision_event = asyncio.Event()
     log.info("QueueDispatcher started")
     while True:
         try:
             await _tick()
         except Exception as e:
             log.error("Dispatcher tick error: %s", e)
-        await asyncio.sleep(5)
+        # Block until a decision wakes us, or 5 s elapses — whichever comes first
+        try:
+            await asyncio.wait_for(_decision_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+        _decision_event.clear()
 
 
 async def _tick() -> None:
@@ -56,8 +71,6 @@ async def _tick() -> None:
         if in_flight:
             return
 
-        # Only auto-send non-night jobs
-        # Only auto-send non-night, non-senior jobs
         next_match = await s.scalar(
             select(Match).where(
                 Match.status == "waiting",

@@ -92,15 +92,6 @@ class EventLog(Base):
     detail = Column(Text)
 
 
-class CoverTemplate(Base):
-    __tablename__ = "cover_templates"
-
-    id = Column(Integer, primary_key=True)
-    role_slug = Column(String(64), unique=True, nullable=False)
-    template = Column(Text, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
 class AppConfig(Base):
     __tablename__ = "app_config"
 

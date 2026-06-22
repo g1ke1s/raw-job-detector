@@ -58,16 +58,3 @@ async def title_seniority_check(title: str) -> str:
 
 async def title_is_relevant_async(title: str) -> bool:
     return await title_seniority_check(title) == "pass"
-
-
-def title_is_relevant(title: str) -> bool:
-    """Sync fallback using hardcoded defaults (no seniority tagging)."""
-    if not title or len(title.strip()) < 3:
-        return False
-    from app.scrapers._tg_defaults import DEFAULTS
-    norm = _norm(title)
-    strong = _compile(DEFAULTS["include_strong"])
-    hard = _compile(DEFAULTS["exclude_hard"])
-    has_strong = any(p.search(norm) for _, p in strong)
-    has_hard = any(p.search(norm) for _, p in hard)
-    return has_strong and not has_hard
