@@ -247,6 +247,34 @@ async def cmd_covers(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def _auto_send_next() -> None:
+    """Immediately dispatch the next waiting job after a Gate 1 decision."""
+    if _app is None:
+        return
+    from app.queue.dispatcher import send_card_direct
+    async with AsyncSessionLocal() as s:
+        in_flight = await s.scalar(select(Match).where(Match.status == "sent_to_user"))
+        if in_flight:
+            return
+        next_match = await s.scalar(
+            select(Match).where(
+                Match.status == "waiting",
+                Match.night_run == False,
+                Match.seniority.is_(None),
+            ).order_by(Match.created_at)
+        )
+        if not next_match:
+            return
+        try:
+            msg_id = await send_card_direct(next_match)
+            next_match.status = "sent_to_user"
+            next_match.telegram_message_id = msg_id
+            next_match.updated_at = datetime.utcnow()
+            await s.commit()
+        except Exception as e:
+            log.error("auto_send_next failed: %s", e)
+
+
 async def _run_apply_downstream(query, match_id: int, source: str, title: str,
                                 company: str, url: str, handle: str | None) -> None:
     """Shared downstream logic after approve or boost decision."""
@@ -258,6 +286,7 @@ async def _run_apply_downstream(query, match_id: int, source: str, title: str,
             await query.edit_message_text(format_hh_details(details, title, url))
         else:
             await query.edit_message_text(f"Approved: {title}\n{url}\n(Could not fetch details)")
+        asyncio.create_task(_auto_send_next())
         return
 
     if source == "telegram" and handle:
@@ -276,6 +305,7 @@ async def _run_apply_downstream(query, match_id: int, source: str, title: str,
                 f"No template for role '{slug or 'unknown'}'.\n{hint}\n\n"
                 f"Use /setcover to add one, then contact {handle} manually."
             )
+            asyncio.create_task(_auto_send_next())
             return
 
         filled = fill_template(template, company, title)
@@ -297,9 +327,11 @@ async def _run_apply_downstream(query, match_id: int, source: str, title: str,
             f"Cover letter ({channel_label}){url_line}:\n\n{filled}",
             reply_markup=kb,
         )
+        # cover_pending: user still deciding, do NOT auto-advance yet
         return
 
     await query.edit_message_text(f"Approved: {title}\n{url}")
+    asyncio.create_task(_auto_send_next())
 
 
 async def _handle_approve(query, match_id: int) -> None:
@@ -372,6 +404,7 @@ async def _handle_skip(query, match_id: int, reason: str) -> None:
         await s.commit()
     await query.edit_message_text("Skipped.")
     await log_event("gate1_skipped", f"match_id={match_id}")
+    asyncio.create_task(_auto_send_next())
 
 
 async def _handle_cover_send(query, match_id: int) -> None:
@@ -400,6 +433,7 @@ async def _handle_cover_send(query, match_id: int) -> None:
         await log_event("cover_sent", f"match_id={match_id} handle={handle}")
     else:
         await query.edit_message_text(f"Failed to send to {handle}. Send manually:\n\n{cover}")
+    asyncio.create_task(_auto_send_next())
 
 
 async def _handle_cover_edit(query, match_id: int) -> None:
@@ -426,6 +460,7 @@ async def _handle_cover_discard(query, match_id: int) -> None:
         s.add(Decision(match_id=match_id, verdict="rejected", reason="cover_discarded"))
         await s.commit()
     await query.edit_message_text("Cover discarded.")
+    asyncio.create_task(_auto_send_next())
 
 
 async def handle_pdf_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

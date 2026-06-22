@@ -156,6 +156,9 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
             per_source["telegram"] = len(jobs)
             await log_event("scrape_done", f"telegram raw={len(jobs)}")
 
+        # URLs already enqueued this run (prevents multi-vacancy same-post duplicates)
+        seen_tg_urls: set[str] = set()
+
         if "remote" in sources:
             from app.scrapers.remote_jobs import scrape_remote_jobs
             jobs = await scrape_remote_jobs()
@@ -190,41 +193,67 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
 
             if source == "telegram":
                 raw_text = item.get("raw_text", "")
-                # Location filter: skip posts that mention non-KZ cities
-                # without any Kazakhstan/Almaty/remote signal
+                url = item.get("url", "")
+
+                # Location filter
                 if location_filter == "almaty":
                     if _NON_KZ_CITIES_RE.search(raw_text) and not _KZ_OR_REMOTE_RE.search(raw_text):
                         continue
+
+                # URL dedup: one entry per Telegram post (prevents multi-role same-post duplicates)
+                if url in seen_tg_urls:
+                    await log_event("dedup_drop", f"[tg] url seen this run: {url}", "INFO")
+                    continue
+                async with AsyncSessionLocal() as s:
+                    url_exists = await s.scalar(
+                        select(Match.id).where(Match.url == url)
+                    ) if url else None
+                if url_exists:
+                    await log_event("dedup_drop", f"[tg] url already in db: {url}", "INFO")
+                    continue
+
                 from app.scrapers.telegram_classify import classify_telegram_post
                 vacancies = await classify_telegram_post(raw_text, min_length=min_len)
+                if not vacancies:
+                    continue
+
+                # Text-based cross-channel dedup on each candidate
+                valid_vacancies = []
                 for vac in vacancies:
-                    company = item.get("channel", "telegram")
-                    # Text-based dedup: same vacancy in different channels → same fingerprint
                     if await is_text_duplicate(vac.text, source):
                         await log_event("dedup_drop", f"[tg] {vac.text[:80]}", "INFO")
-                        continue
-                    if "llm" in vac.reason:
-                        llm_calls += 1
-                    handle = _extract_handle(raw_text)
-                    await _enqueue(
-                        source=source,
-                        title=vac.role or "Job (Telegram)",
-                        company=company,
-                        url=item.get("url", ""),
-                        description=vac.text[:1000],
-                        rule_score=vac.rule_score,
-                        low_conf=vac.low_conf,
-                        recruiter_handle=handle,
-                        night_run=night_run,
-                        seniority=None,
-                        job_json=item,
-                        extra={
-                            "channel": item.get("channel"),
-                            "reason": vac.reason,
-                            "pub_date": item.get("pub_date"),
-                        },
-                    )
-                    enqueued += 1
+                    else:
+                        valid_vacancies.append(vac)
+
+                if not valid_vacancies:
+                    continue
+
+                # Pick only the best-scoring vacancy per post (avoids flooding with same-post roles)
+                best_vac = max(valid_vacancies, key=lambda v: v.rule_score)
+                seen_tg_urls.add(url)
+
+                if "llm" in best_vac.reason:
+                    llm_calls += 1
+                handle = _extract_handle(raw_text)
+                await _enqueue(
+                    source=source,
+                    title=best_vac.role or "Job (Telegram)",
+                    company=item.get("channel", "telegram"),
+                    url=url,
+                    description=best_vac.text[:1000],
+                    rule_score=best_vac.rule_score,
+                    low_conf=best_vac.low_conf,
+                    recruiter_handle=handle,
+                    night_run=night_run,
+                    seniority=None,
+                    job_json=item,
+                    extra={
+                        "channel": item.get("channel"),
+                        "reason": best_vac.reason,
+                        "pub_date": item.get("pub_date"),
+                    },
+                )
+                enqueued += 1
             else:
                 title = item.get("title", "")
                 company = item.get("company", "")
