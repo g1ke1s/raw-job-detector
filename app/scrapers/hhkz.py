@@ -41,12 +41,17 @@ async def _warmup(client: httpx.AsyncClient) -> None:
 
 def _parse_date(s: str) -> Optional[datetime]:
     s = (s or "").strip().lower()
+    now = datetime.utcnow()
+    # hh.kz shows relative labels for recent postings
+    if s.startswith("сегодня"):
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if s.startswith("вчера"):
+        return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
     m = re.match(r"(\d{1,2})\s+(\w+)", s)
     if m and m.group(2) in _MONTHS:
-        now = datetime.utcnow()
         return datetime(now.year, _MONTHS[m.group(2)], int(m.group(1)))
     return None
 
@@ -103,7 +108,9 @@ async def scrape_hhkz(days_back: int = 1, per_role: int = 50, area: int = 160) -
 
                         date_el = card.select_one("span[data-qa='vacancy-serp__vacancy-date']")
                         pub_date = _parse_date(date_el.get_text(strip=True)) if date_el else None
-                        if pub_date is None or pub_date < cutoff:
+                        # Only skip if we have a parseable date AND it's before the cutoff.
+                        # Unknown date format (pub_date is None) → include rather than drop.
+                        if pub_date is not None and pub_date < cutoff:
                             continue
 
                         seen_ids.add(job_id)
