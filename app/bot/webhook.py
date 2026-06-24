@@ -23,6 +23,8 @@ from app.runtime_config import rc
 log = logging.getLogger(__name__)
 
 _pending_cv_text: set[int] = set()
+# PDF bytes waiting for user confirmation before being sent to recruiter
+_pending_pdfs: dict[int, bytes] = {}
 _app = None
 
 # Imported at module level — used in handle_message for /setcv text paste
@@ -277,38 +279,133 @@ async def _handle_boost(query, match_id: int) -> None:
 
     await log_event("gate1_boosted", f"match_id={match_id} source={source}")
 
-    # Two background LLM tasks — fire-and-forget, never block the Gate 1 response
+    # Background: generate cover letter + tailor CV, then send preview with confirm button
     if _app:
-        asyncio.create_task(_send_fit_assessment(match_id, title))
-        asyncio.create_task(_send_cover_letter(match_id, title, company))
+        asyncio.create_task(_boost_generate_and_preview(match_id, title, company))
 
     await _run_apply_downstream(query, match_id, source, title, company, url, handle)
 
 
-async def _send_fit_assessment(match_id: int, job_title: str) -> None:
-    from app.cv.fit import assess_fit
+async def _boost_generate_and_preview(match_id: int, title: str, company: str) -> None:
+    """
+    Background task after Boost:
+      1. Generate cover letter (LLM)
+      2. Tailor + compile LaTeX CV (LLM + tectonic)
+      3. Send preview to user with "📤 Send now" confirmation button
+    """
+    cover_text: str | None = None
+    pdf_bytes: bytes | None = None
+    tailor_status = ""
+
     try:
-        text = await assess_fit(match_id)
-        if text and _app:
-            await _app.bot.send_message(
-                chat_id=settings.telegram_chat_id,
-                text=f"Fit assessment [{job_title}]:\n\n{text}",
-            )
+        from app.cv.cover import generate_cover
+        cover_text = await generate_cover(match_id)
     except Exception as e:
-        log.error("Fit assessment failed for match %d: %s", match_id, e)
+        log.error("Boost cover generation failed for match %d: %s", match_id, e)
+
+    try:
+        from app.cv.tailor import tailor_and_render
+        pdf_bytes, tailor_status = await tailor_and_render(match_id)
+    except Exception as e:
+        log.error("Boost CV tailor failed for match %d: %s", match_id, e)
+        tailor_status = str(e)
+
+    if pdf_bytes:
+        _pending_pdfs[match_id] = pdf_bytes
+
+    if not _app:
+        return
+
+    if cover_text:
+        cv_line = (
+            "Tailored CV ready — will be sent as PDF attachment."
+            if pdf_bytes
+            else f"CV tailoring failed: {tailor_status[:120]}"
+        )
+        preview = (
+            f"Cover letter [{title} @ {company}]:\n\n"
+            f"{cover_text}\n\n"
+            f"---\n{cv_line}"
+        )
+    else:
+        preview = f"Cover letter generation failed for {title} @ {company}. Check /errors."
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    kb = None
+    if cover_text or pdf_bytes:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📤 Send now", callback_data=f"boost_send_{match_id}"),
+        ]])
+
+    await _app.bot.send_message(
+        chat_id=settings.telegram_chat_id,
+        text=preview[:4000],
+        reply_markup=kb,
+    )
 
 
-async def _send_cover_letter(match_id: int, job_title: str, company: str) -> None:
-    from app.cv.cover import generate_cover
-    try:
-        letter = await generate_cover(match_id)
-        if letter and _app:
-            await _app.bot.send_message(
+async def _handle_boost_send(query, match_id: int) -> None:
+    """Send cover letter + tailored CV to the recruiter via the correct channel."""
+    await query.edit_message_reply_markup(reply_markup=None)  # remove button
+
+    async with AsyncSessionLocal() as s:
+        match = await s.get(Match, match_id)
+        if not match:
+            await query.answer("Match not found.", show_alert=True)
+            return
+        cover_text = match.cover_text or ""
+        handle = match.recruiter_handle
+        source = match.source
+        url = match.url or ""
+        title = _clean(match.title or "")
+        company = _clean(match.company or "")
+
+    pdf_bytes = _pending_pdfs.pop(match_id, None)
+
+    if not cover_text:
+        await _app.bot.send_message(
+            chat_id=settings.telegram_chat_id,
+            text="No cover letter available. Re-run Boost to regenerate.",
+        )
+        return
+
+    if not handle:
+        # HH, LinkedIn, or any source without a direct recruiter contact
+        msg = f"No direct recruiter channel for this job. Apply manually at:\n{url}"
+        if pdf_bytes:
+            import io
+            bio = io.BytesIO(pdf_bytes)
+            bio.name = f"CV_{match_id}.pdf"
+            await _app.bot.send_document(
                 chat_id=settings.telegram_chat_id,
-                text=f"Cover letter [{job_title} @ {company}]:\n\n{letter}",
+                document=bio,
+                filename=f"CV_{match_id}.pdf",
+                caption="Tailored CV (for manual upload)",
             )
-    except Exception as e:
-        log.error("Cover letter generation failed for match %d: %s", match_id, e)
+        await _app.bot.send_message(chat_id=settings.telegram_chat_id, text=msg)
+        return
+
+    filename = f"CV_{title[:30].replace(' ', '_')}_{match_id}.pdf"
+
+    if handle.startswith("@"):
+        from app.appliers.tg_sender import send_dm, send_dm_with_document
+        if pdf_bytes:
+            ok = await send_dm_with_document(handle, cover_text, pdf_bytes, filename)
+        else:
+            ok = await send_dm(handle, cover_text)
+        result = f"DM sent to {handle}." if ok else f"DM failed to {handle}. Check /errors."
+    else:
+        # Email address
+        from app.appliers.email_sender import send_email, send_email_with_pdf
+        subject = f"Application: {title} at {company}"
+        if pdf_bytes:
+            ok = await send_email_with_pdf(handle, subject, cover_text, pdf_bytes, filename)
+        else:
+            ok = await send_email(handle, subject, cover_text)
+        result = f"Email sent to {handle}." if ok else f"Email failed to {handle}. Check /errors."
+
+    await _app.bot.send_message(chat_id=settings.telegram_chat_id, text=result)
+    await log_event("boost_sent", f"match_id={match_id} handle={handle} ok={ok}")
 
 
 async def _handle_skip(query, match_id: int, reason: str) -> None:
@@ -396,6 +493,8 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await _handle_boost(query, int(data.split("_")[-1]))
     elif data.startswith("g1_skip_"):
         await _handle_skip(query, int(data.split("_")[-1]), "skipped")
+    elif data.startswith("boost_send_"):
+        await _handle_boost_send(query, int(data.split("_")[-1]))
     elif data.startswith("boost_tailor_"):
         await _handle_boost_tailor(query, int(data.split("_")[-1]))
     elif data.startswith("cfg_src_"):
@@ -566,19 +665,20 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             status_label = "senior_hidden"
         else:
             status_label = m.status
+        # fit_assessment_json kept for historical records from before this field was removed
         fit = m.fit_assessment_json or {}
         rows.append({
-            "date": m.created_at.strftime("%Y-%m-%d") if m.created_at else "",
-            "title": m.title or "",
-            "company": m.company or "",
-            "source": m.source or "",
-            "score": round(m.rule_score or 0, 2),
-            "seniority": m.seniority or "",
-            "status": status_label,
-            "fit_score": fit.get("score", ""),
-            "fit_blockers": "; ".join(fit.get("blockers", [])),
-            "url": m.url or "",
-            "pub_date": (m.extra or {}).get("pub_date", ""),
+            "date":          m.created_at.strftime("%Y-%m-%d") if m.created_at else "",
+            "title":         m.title or "",
+            "company":       m.company or "",
+            "source":        m.source or "",
+            "score":         round(m.rule_score or 0, 2),
+            "seniority":     m.seniority or "",
+            "status":        status_label,
+            "fit_score":     fit.get("score", ""),
+            "fit_blockers":  "; ".join(fit.get("blockers", [])),
+            "url":           m.url or "",
+            "pub_date":      (m.extra or {}).get("pub_date", ""),
         })
 
     output = io.StringIO()
@@ -624,6 +724,7 @@ async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── CV commands ───────────────────────────────────────────────────────────────
 
 async def _handle_boost_tailor(query, match_id: int) -> None:
+    """Manual tailor button from /cv — renders and sends PDF directly to this chat."""
     await query.edit_message_text("Tailoring CV... this may take a moment.")
     try:
         from app.cv.tailor import tailor_and_render
@@ -723,7 +824,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/resume — unpause\n\n"
         "Gate 1 buttons\n"
         "Approve — mark approved, show details, auto-advance\n"
-        "Boost — approve + fit assessment + cover letter (2 LLM calls)\n"
+        "Boost — approve + cover letter + tailored LaTeX CV, then confirm to send\n"
         "Skip — reject immediately, auto-advance"
     )
     await update.message.reply_text(text)

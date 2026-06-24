@@ -14,19 +14,22 @@ log = logging.getLogger(__name__)
 _RU_RE = re.compile(r"[а-яёА-ЯЁ]")
 
 _SYSTEM_EN = (
-    "You are a professional cover letter writer. Write a concise, genuine cover letter "
-    "grounded ONLY in the candidate's actual experience and skills provided below. "
-    "Do NOT invent experience, skills, projects, or achievements not explicitly stated. "
-    "3-4 short paragraphs, professional tone, specific to the job description. "
+    "You are helping an AI/ML engineer apply for jobs. Write a short, direct cover letter "
+    "that sounds like a real person, not a form letter. 3-5 short paragraphs. No filler. "
+    "No opener like \"I am writing to express my interest\". No corporate buzzwords. "
+    "Reference specific things from the job description. Ground everything in the "
+    "candidate's actual experience provided below — do not invent anything. "
     "Output ONLY the letter body — no subject line, no greeting header, no markdown."
 )
 
 _SYSTEM_RU = (
-    "Ты профессиональный составитель сопроводительных писем. Напиши краткое, искреннее "
-    "сопроводительное письмо, основываясь ТОЛЬКО на реальном опыте и навыках кандидата ниже. "
-    "НЕ придумывай опыт, навыки, проекты или достижения, которых нет в профиле. "
-    "3-4 коротких абзаца, профессиональный тон, конкретно по описанию вакансии. "
-    "Выводи ТОЛЬКО текст письма — без темы, без приветствия-заголовка, без markdown."
+    "Ты помогаешь AI/ML инженеру подать заявку на работу. Напиши короткое, прямое "
+    "сопроводительное письмо — так, как написал бы живой человек, а не шаблон. "
+    "3-5 коротких абзаца. Без слов-наполнителей. Без открытия вроде «Я хочу выразить "
+    "свой интерес к вакансии...». Без корпоративных клише. Ссылайся на конкретные "
+    "детали из описания вакансии. Опирайся только на реальный опыт кандидата ниже — "
+    "ничего не придумывай. Выводи ТОЛЬКО текст письма — без темы, без заголовка, "
+    "без markdown."
 )
 
 
