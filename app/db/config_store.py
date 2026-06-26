@@ -16,13 +16,19 @@ log = logging.getLogger(__name__)
 
 _DEFAULTS: dict[str, Any] = {
     "include_strong": [
-        # English roles
+        # English roles — full phrases
         "data scientist", "ml engineer", "machine learning engineer",
         "ai engineer", "mlops", "data engineer", "data analyst",
         "nlp engineer", "computer vision engineer", "ml researcher", "deep learning engineer",
         "data science", "analytics engineer", "bi analyst", "bi developer", "bi engineer",
         "llm engineer", "llm developer", "machine learning", "artificial intelligence engineer",
         "applied scientist", "research scientist", "decision scientist",
+        # Short abbreviations (word-bounded via lookbehind/lookahead in _compile).
+        # Required for compound titles: "ML/CV Engineer"→"ml cv engineer",
+        # "AI/ML Engineer"→"ai ml engineer", "Backend Engineer (ML)"→"... ml".
+        # "ml" won't match inside "xml"/"html" — the lookbehind catches the preceding letter.
+        # "cv engineer" is scoped (not bare "cv") to avoid matching "curriculum vitae".
+        "ml", "ai", "nlp", "cv engineer",
         # Russian roles
         "дата сайентист", "ml инженер",
         "инженер машинного обучения", "машинного обучения",
