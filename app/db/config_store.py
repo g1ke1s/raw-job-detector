@@ -24,11 +24,14 @@ _DEFAULTS: dict[str, Any] = {
         "llm engineer", "llm developer", "machine learning", "artificial intelligence engineer",
         "applied scientist", "research scientist", "decision scientist",
         # Short abbreviations (word-bounded via lookbehind/lookahead in _compile).
-        # Required for compound titles: "ML/CV Engineer"→"ml cv engineer",
+        # Family A — AI/ML Engineering: covers compound titles like "ML/CV Engineer"→"ml cv engineer",
         # "AI/ML Engineer"→"ai ml engineer", "Backend Engineer (ML)"→"... ml".
-        # "ml" won't match inside "xml"/"html" — the lookbehind catches the preceding letter.
-        # "cv engineer" is scoped (not bare "cv") to avoid matching "curriculum vitae".
-        "ml", "ai", "nlp", "cv engineer",
+        # "ml"/"ai" won't match inside "xml"/"html" — lookbehind catches preceding letter.
+        # "cv engineer" scoped (not bare "cv") to avoid matching "curriculum vitae".
+        "ml", "ai", "nlp", "cv engineer", "mle",
+        # Family B — Data roles: DS/DE/DA abbreviations
+        "ds", "de", "da",
+        # Family C — BI/Analytics (full phrases already above; standalone BI handled by "bi analyst" etc.)
         # Russian roles
         "дата сайентист", "ml инженер",
         "инженер машинного обучения", "машинного обучения",

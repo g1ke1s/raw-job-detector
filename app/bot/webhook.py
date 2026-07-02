@@ -27,6 +27,11 @@ _pending_cv_text: set[int] = set()
 _pending_pdfs: dict[int, bytes] = {}
 _app = None
 
+# /find overview state — tracks the most recent find run so decisions update the overview
+_find_overview_msg_id: int | None = None
+_find_overview_matches: list[tuple[int, str, str, float]] = []  # (match_id, title, company, score)
+_find_overview_decisions: dict[int, str] = {}  # match_id → "✅" / "🚀" / "❌"
+
 # Imported at module level — used in handle_message for /setcv text paste
 from app.cv.ingest import _SYSTEM as _SYSTEM_CV_PARSE
 
@@ -78,21 +83,93 @@ async def _logs_text() -> str:
     )
 
 
-async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "almaty") -> None:
-    from app.queue.processor import run_pipeline
-    result = await run_pipeline(location_filter=location_filter)
-    if "error" in result:
-        text = f"Pipeline error:\n{result['error']}"
-    else:
-        loc_tag = "" if location_filter == "almaty" else f" [{location_filter.upper()}]"
-        text = (
-            f"Done{loc_tag}.\n"
-            f"Scraped: {result['scraped']}\n"
-            f"Enqueued: {result['enqueued']}\n"
-            f"LLM calls: {result['llm_calls']}"
+def _build_find_overview_keyboard():
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = []
+    for i, (mid, title, company, score) in enumerate(_find_overview_matches):
+        icon = _find_overview_decisions.get(mid)
+        if icon:
+            label = f"{icon} {title[:30]} · {company[:20]}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"find_noop_{mid}")])
+        else:
+            pct = int(score * 100)
+            label = f"{i + 1}. {title[:25]} · {company[:15]} · {pct}% 👁"
+            rows.append([InlineKeyboardButton(label, callback_data=f"find_view_{mid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _update_find_overview(match_id: int, icon: str) -> None:
+    """Edit the /find overview message to reflect a Gate 1 decision."""
+    if _find_overview_msg_id is None:
+        return
+    if not any(mid == match_id for mid, *_ in _find_overview_matches):
+        return
+    _find_overview_decisions[match_id] = icon
+    try:
+        await _app.bot.edit_message_reply_markup(
+            chat_id=settings.telegram_chat_id,
+            message_id=_find_overview_msg_id,
+            reply_markup=_build_find_overview_keyboard(),
         )
+    except Exception:
+        pass  # message >48h old or other Telegram error — silently ignore
+
+
+async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "almaty") -> None:
+    global _find_overview_msg_id, _find_overview_matches, _find_overview_decisions
+
+    from app.queue.processor import run_pipeline
+    start_ts = datetime.utcnow()
+    result = await run_pipeline(location_filter=location_filter)
+
+    if "error" in result:
+        await bot.edit_message_text(
+            chat_id=settings.telegram_chat_id, message_id=msg_id,
+            text=f"Pipeline error:\n{result['error']}",
+        )
+        return
+
+    loc_tag = "" if location_filter == "almaty" else f" [{location_filter.upper()}]"
+
+    if not result.get("enqueued"):
+        await bot.edit_message_text(
+            chat_id=settings.telegram_chat_id, message_id=msg_id,
+            text=f"Done{loc_tag}. Scraped {result['scraped']}, nothing new.",
+        )
+        return
+
+    # Fetch matches created during this run (waiting, non-senior) ordered by score
+    async with AsyncSessionLocal() as s:
+        new_matches = (await s.execute(
+            select(Match)
+            .where(
+                Match.status == "waiting",
+                Match.created_at >= start_ts,
+                Match.night_run == False,
+                Match.seniority.is_(None),
+            )
+            .order_by(Match.rule_score.desc())
+        )).scalars().all()
+
+    if not new_matches:
+        await bot.edit_message_text(
+            chat_id=settings.telegram_chat_id, message_id=msg_id,
+            text=f"Done{loc_tag}. Scraped {result['scraped']}, nothing new.",
+        )
+        return
+
+    _find_overview_matches = [
+        (m.id, _clean(m.title or ""), _clean(m.company or ""), m.rule_score or 0.0)
+        for m in new_matches
+    ]
+    _find_overview_decisions = {}
+    _find_overview_msg_id = msg_id
+
     await bot.edit_message_text(
-        chat_id=settings.telegram_chat_id, message_id=msg_id, text=text,
+        chat_id=settings.telegram_chat_id,
+        message_id=msg_id,
+        text=f"Found {len(new_matches)} jobs:",
+        reply_markup=_build_find_overview_keyboard(),
     )
 
 
@@ -219,25 +296,10 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _run_apply_downstream(query, match_id: int, source: str, title: str,
                                 company: str, url: str, handle: str | None) -> None:
     """Common downstream logic after Approve or Boost sets a match to approved."""
-    if source == "hh" and url:
-        await query.edit_message_text("Approved. Fetching details...")
-        from app.scrapers.hh_detail import fetch_hh_details, format_hh_details
-        details = await fetch_hh_details(url)
-        if details:
-            await query.edit_message_text(format_hh_details(details, title, url))
-        else:
-            await query.edit_message_text(f"Approved: {title}\n{url}\n(Could not fetch details)")
-        _notify_dispatcher()
-        return
-
-    if source == "telegram" and handle:
-        url_line = f"\n{url}" if url else ""
-        channel = f"Email: {handle}" if not handle.startswith("@") else f"Contact: {handle}"
-        await query.edit_message_text(f"Approved — {channel}{url_line}")
-        _notify_dispatcher()
-        return
-
-    await query.edit_message_text(f"Approved: {title}\n{url}")
+    text = f"✅ {title} · {company}"
+    if url:
+        text += f"\n🔗 {url}"
+    await query.edit_message_text(text)
     _notify_dispatcher()
 
 
@@ -258,6 +320,7 @@ async def _handle_approve(query, match_id: int) -> None:
         handle = match.recruiter_handle
 
     await log_event("gate1_approved", f"match_id={match_id} source={source}")
+    await _update_find_overview(match_id, "✅")
     await _run_apply_downstream(query, match_id, source, title, company, url, handle)
 
 
@@ -278,6 +341,7 @@ async def _handle_boost(query, match_id: int) -> None:
         handle = match.recruiter_handle
 
     await log_event("gate1_boosted", f"match_id={match_id} source={source}")
+    await _update_find_overview(match_id, "🚀")
 
     # Background: generate cover letter + tailor CV, then send preview with confirm button
     if _app:
@@ -316,30 +380,32 @@ async def _boost_generate_and_preview(match_id: int, title: str, company: str) -
     if not _app:
         return
 
-    if cover_text:
-        cv_line = (
-            "Tailored CV ready — will be sent as PDF attachment."
-            if pdf_bytes
-            else f"CV tailoring failed: {tailor_status[:120]}"
+    if not cover_text:
+        await _app.bot.send_message(
+            chat_id=settings.telegram_chat_id,
+            text=f"Cover letter generation failed for {title} @ {company}. Check /errors.",
         )
-        preview = (
-            f"Cover letter [{title} @ {company}]:\n\n"
-            f"{cover_text}\n\n"
-            f"---\n{cv_line}"
-        )
-    else:
-        preview = f"Cover letter generation failed for {title} @ {company}. Check /errors."
+        return
 
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    kb = None
-    if cover_text or pdf_bytes:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📤 Send now", callback_data=f"boost_send_{match_id}"),
-        ]])
-
+    # Message 1: letter text only — zero extra content, user can select-all and copy on mobile
     await _app.bot.send_message(
         chat_id=settings.telegram_chat_id,
-        text=preview[:4000],
+        text=cover_text[:4000],
+    )
+
+    # Message 2: job header + confirm button only
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    action_lines = [f"{title} · {company}"]
+    if not pdf_bytes and tailor_status:
+        action_lines.append(f"CV: {tailor_status[:80]}")
+    action_text = "\n".join(action_lines)
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📤 Send now", callback_data=f"boost_send_{match_id}"),
+    ]])
+    await _app.bot.send_message(
+        chat_id=settings.telegram_chat_id,
+        text=action_text,
         reply_markup=kb,
     )
 
@@ -420,7 +486,37 @@ async def _handle_skip(query, match_id: int, reason: str) -> None:
         await s.commit()
     await query.edit_message_text("Skipped.")
     await log_event("gate1_skipped", f"match_id={match_id}")
+    await _update_find_overview(match_id, "❌")
     _notify_dispatcher()
+
+
+async def _handle_find_view(query, match_id: int) -> None:
+    """Send a full job card when user taps [👁] in the /find overview."""
+    async with AsyncSessionLocal() as s:
+        match = await s.get(Match, match_id)
+
+    if not match:
+        await query.answer("Job no longer available.", show_alert=True)
+        return
+
+    if match.status in ("approved", "rejected"):
+        icon = "✅" if match.status == "approved" else "❌"
+        await query.answer(f"{icon} Already decided.", show_alert=False)
+        return
+
+    from app.queue.dispatcher import send_card_direct
+    try:
+        msg_id = await send_card_direct(match)
+        async with AsyncSessionLocal() as s:
+            m = await s.get(Match, match_id)
+            if m and m.status == "waiting":
+                m.status = "sent_to_user"
+                m.telegram_message_id = msg_id
+                m.updated_at = datetime.utcnow()
+                await s.commit()
+    except Exception as e:
+        log.error("find_view error for match %d: %s", match_id, e)
+        await query.answer("Error showing job card.", show_alert=True)
 
 
 # ── CV upload / text-paste handlers ──────────────────────────────────────────
@@ -493,6 +589,12 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await _handle_boost(query, int(data.split("_")[-1]))
     elif data.startswith("g1_skip_"):
         await _handle_skip(query, int(data.split("_")[-1]), "skipped")
+    elif data.startswith("find_view_"):
+        await _handle_find_view(query, int(data.split("_")[-1]))
+    elif data.startswith("find_noop_"):
+        mid = int(data.split("_")[-1])
+        icon = _find_overview_decisions.get(mid, "?")
+        await query.answer(f"Already decided: {icon}", show_alert=False)
     elif data.startswith("boost_send_"):
         await _handle_boost_send(query, int(data.split("_")[-1]))
     elif data.startswith("boost_tailor_"):

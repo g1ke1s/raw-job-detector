@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import re
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
@@ -13,6 +15,13 @@ from app.runtime_config import rc
 log = logging.getLogger(__name__)
 _bot_app = None
 _decision_event: asyncio.Event | None = None
+
+_SOURCE_DISPLAY = {
+    "hh": "hh.kz",
+    "linkedin": "LinkedIn",
+    "telegram": "Telegram",
+    "remote": "Remote",
+}
 
 
 def set_bot(app) -> None:
@@ -36,7 +45,6 @@ async def dispatch_loop() -> None:
             await _tick()
         except Exception as e:
             log.error("Dispatcher tick error: %s", e)
-        # Block until a decision wakes us, or 5 s elapses — whichever comes first
         try:
             await asyncio.wait_for(_decision_event.wait(), timeout=5.0)
         except asyncio.TimeoutError:
@@ -91,38 +99,46 @@ async def _tick() -> None:
             log.error("Failed to send Gate 1 card for match %d: %s", next_match.id, e)
 
 
+def _clean(t: str) -> str:
+    t = html.unescape(t or "")
+    t = re.sub(r"<[^>]+>", " ", t)
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
+def _build_card_text(match: Match) -> str:
+    title = _clean(match.title or "Unknown role")
+    company = _clean(match.company or "")
+
+    desc = _clean(match.description or "")
+    if len(desc) > 200:
+        cut = desc[:200].rsplit(" ", 1)[0]
+        desc = cut + "..."
+
+    source_label = _SOURCE_DISPLAY.get(match.source or "", match.source or "")
+    salary = _clean((match.job_json or {}).get("salary", "") or "") if match.job_json else ""
+    salary_line = f"💰 {salary}" if salary else "💰 Not specified"
+
+    lines = [title]
+    if company:
+        lines.append(company)
+    if desc:
+        lines += ["", desc]
+    lines += ["", f"{salary_line} · {source_label}"]
+    if match.url:
+        lines += ["", f"🔗 {match.url}"]
+    return "\n".join(lines)
+
+
 async def _send_gate1_card(match: Match) -> int:
     from app.config import settings
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    import html, re
 
-    def _clean(t: str) -> str:
-        t = html.unescape(t or "")
-        t = re.sub(r"<[^>]+>", " ", t)
-        return re.sub(r"\s{2,}", " ", t).strip()
-
-    low_conf_tag = " ⚠️ LOW CONF" if match.low_conf else ""
-    handle_tag = f" | {match.recruiter_handle}" if match.recruiter_handle else ""
-    source_tag = match.source.upper()
-    pub_date = (match.extra or {}).get("pub_date")
-    date_tag = f"\nDate: {pub_date}" if pub_date else ""
-
-    text = (
-        f"[{source_tag}{low_conf_tag}]{handle_tag}\n"
-        f"{_clean(match.title or 'Unknown role')}\n"
-        f"{_clean(match.company or '')}{date_tag}\n\n"
-        f"{_clean(match.description or '')[:400]}\n\n"
-        f"Score: {match.rule_score:.2f}"
-    )
-    if match.url:
-        text += f"\n{match.url}"
-
+    text = _build_card_text(match)
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"g1_approve_{match.id}"),
         InlineKeyboardButton("🚀 Boost", callback_data=f"g1_boost_{match.id}"),
         InlineKeyboardButton("❌ Skip", callback_data=f"g1_skip_{match.id}"),
     ]])
-
     msg = await _bot_app.bot.send_message(
         chat_id=settings.telegram_chat_id,
         text=text,
