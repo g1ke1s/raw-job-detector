@@ -56,5 +56,6 @@ def settings_keyboard(current_sources: list, days: int, max_matches: int) -> Inl
         InlineKeyboardButton("50", callback_data="cfg_max_50"),
     ])
 
+    rows.append([InlineKeyboardButton("📄 View config.yaml", callback_data="cfg_show_config")])
     rows.append([InlineKeyboardButton("« Back", callback_data="cmd_back")])
     return InlineKeyboardMarkup(rows)

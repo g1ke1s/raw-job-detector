@@ -102,10 +102,12 @@ class FindSession(Base):
     id = Column(Integer, primary_key=True)
     chat_id = Column(BigInteger, nullable=False)
     message_id = Column(BigInteger, nullable=False)
-    match_ids = Column(JSON, nullable=False)  # ordered list[int] — display order
-    decisions = Column(JSON, default=dict)    # {str(match_id): icon}
+    match_ids = Column(JSON, nullable=False)          # list[int] — regular jobs, display order
+    senior_match_ids = Column(JSON, nullable=True)    # list[int] — senior-tagged jobs
+    seniors_expanded = Column(Boolean, default=False, nullable=True)
+    decisions = Column(JSON, default=dict)            # {str(match_id): icon}
     created_at = Column(DateTime, default=datetime.utcnow)
-    closed_at = Column(DateTime, nullable=True)  # NULL = active
+    closed_at = Column(DateTime, nullable=True)       # NULL = active
 
 
 class AppConfig(Base):

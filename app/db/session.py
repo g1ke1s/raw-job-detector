@@ -24,6 +24,8 @@ async def init_db() -> None:
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS job_json JSONB",
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS fit_assessment_json JSONB",
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS cv_tailor_json JSONB",
+            "ALTER TABLE find_sessions ADD COLUMN IF NOT EXISTS senior_match_ids JSONB",
+            "ALTER TABLE find_sessions ADD COLUMN IF NOT EXISTS seniors_expanded BOOLEAN DEFAULT FALSE",
         ]:
             try:
                 await conn.execute(text(stmt))
