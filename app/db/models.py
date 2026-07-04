@@ -92,6 +92,22 @@ class EventLog(Base):
     detail = Column(Text)
 
 
+class FindSession(Base):
+    """Tracks an active /find or /findall browse session.
+    Closed when all jobs are decided or user runs /find again.
+    Dispatcher checks closed_at IS NULL before auto-sending cards.
+    """
+    __tablename__ = "find_sessions"
+
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger, nullable=False)
+    message_id = Column(BigInteger, nullable=False)
+    match_ids = Column(JSON, nullable=False)  # ordered list[int] — display order
+    decisions = Column(JSON, default=dict)    # {str(match_id): icon}
+    created_at = Column(DateTime, default=datetime.utcnow)
+    closed_at = Column(DateTime, nullable=True)  # NULL = active
+
+
 class AppConfig(Base):
     __tablename__ = "app_config"
 

@@ -59,6 +59,16 @@ async def _tick() -> None:
     if is_paused():
         return
 
+    # Do not auto-send cards while an interactive browse session is active.
+    # Session-flag check — not a race condition fix.
+    from app.db.models import FindSession
+    async with AsyncSessionLocal() as s:
+        active_session = await s.scalar(
+            select(FindSession).where(FindSession.closed_at.is_(None))
+        )
+    if active_session:
+        return
+
     timeout_h = int(rc.get("approval.approval_timeout_hours") or 24)
     cutoff = datetime.utcnow() - timedelta(hours=timeout_h)
 
