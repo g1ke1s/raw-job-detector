@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import re
 from datetime import datetime
 
@@ -23,19 +24,19 @@ from app.runtime_config import rc
 log = logging.getLogger(__name__)
 
 _pending_cv_text: set[int] = set()
-# PDF bytes waiting for Boost "Send + apply" confirmation
 _pending_pdfs: dict[int, bytes] = {}
 _app = None
 
-# ── Find session state (DB is source of truth; memory is a cache) ─────────────
+# ── Find session state (DB is source of truth; memory is a cache) ──────────────
 _active_session_id: int | None = None
 _active_session_msg_id: int | None = None
-_active_session_match_ids: list[int] = []
-_active_session_decisions: dict[int, str] = {}  # match_id (int) → "✅"/"❌"/"🚀"
-_current_detail_match_id: int | None = None     # job currently in detail/cover view
-_boost_target_match_id: int | None = None       # anti-race: cleared when user navigates away
+_active_session_match_ids: list[int] = []           # regular jobs
+_active_session_senior_ids: list[int] = []          # senior-tagged jobs
+_active_session_seniors_expanded: bool = False
+_active_session_decisions: dict[int, str] = {}      # match_id → icon
+_current_detail_match_id: int | None = None
+_boost_target_match_id: int | None = None
 
-# CV-parse system prompt imported at module level for handle_message
 from app.cv.ingest import _SYSTEM as _SYSTEM_CV_PARSE
 
 _SOURCE_DISPLAY = {"hh": "hh.kz", "linkedin": "LinkedIn", "telegram": "Telegram", "remote": "Remote"}
@@ -77,15 +78,27 @@ def _health_text() -> str:
 
 async def _logs_text() -> str:
     async with AsyncSessionLocal() as s:
+        errors = (await s.execute(
+            select(EventLog)
+            .where(EventLog.level.in_(["WARNING", "ERROR"]))
+            .order_by(EventLog.ts.desc())
+            .limit(5)
+        )).scalars().all()
         events = (await s.execute(
-            select(EventLog).order_by(EventLog.ts.desc()).limit(15)
+            select(EventLog).order_by(EventLog.ts.desc()).limit(20)
         )).scalars().all()
     if not events:
         return "No events yet."
-    return "\n".join(
-        f"{e.ts.strftime('%H:%M:%S')} [{e.level}] {e.event}: {e.detail}"
-        for e in reversed(events)
-    )
+    lines = []
+    if errors:
+        lines.append("Recent errors:")
+        for e in reversed(errors):
+            lines.append(f"  {e.ts.strftime('%H:%M:%S')} [{e.level}] {e.detail}")
+        lines.append("")
+    lines.append("Recent events:")
+    for e in reversed(events):
+        lines.append(f"{e.ts.strftime('%H:%M:%S')} [{e.level}] {e.event}: {e.detail}")
+    return "\n".join(lines)
 
 
 def _notify_dispatcher() -> None:
@@ -96,8 +109,9 @@ def _notify_dispatcher() -> None:
 # ── Find session DB helpers ────────────────────────────────────────────────────
 
 async def _ensure_session_loaded() -> bool:
-    """Load active session from DB into memory if not already loaded. Returns True if found."""
-    global _active_session_id, _active_session_msg_id, _active_session_match_ids, _active_session_decisions
+    """Load active session from DB into memory cache if not already loaded."""
+    global _active_session_id, _active_session_msg_id, _active_session_match_ids
+    global _active_session_decisions, _active_session_senior_ids, _active_session_seniors_expanded
     if _active_session_id is not None:
         return True
     async with AsyncSessionLocal() as s:
@@ -108,15 +122,22 @@ async def _ensure_session_loaded() -> bool:
             return False
         _active_session_id = session.id
         _active_session_msg_id = session.message_id
-        _active_session_match_ids = list(session.match_ids)
+        _active_session_match_ids = list(session.match_ids or [])
+        _active_session_senior_ids = list(session.senior_match_ids or [])
+        _active_session_seniors_expanded = bool(session.seniors_expanded)
         _active_session_decisions = {int(k): v for k, v in (session.decisions or {}).items()}
         return True
 
 
-async def _create_session(message_id: int, match_ids: list[int]) -> None:
+async def _create_session(
+    message_id: int,
+    match_ids: list[int],
+    senior_match_ids: list[int] | None = None,
+) -> None:
     """Close any existing session and open a new one."""
     global _active_session_id, _active_session_msg_id, _active_session_match_ids
     global _active_session_decisions, _current_detail_match_id, _boost_target_match_id
+    global _active_session_senior_ids, _active_session_seniors_expanded
     async with AsyncSessionLocal() as s:
         existing = await s.scalar(select(FindSession).where(FindSession.closed_at.is_(None)))
         if existing:
@@ -125,6 +146,8 @@ async def _create_session(message_id: int, match_ids: list[int]) -> None:
             chat_id=settings.telegram_chat_id,
             message_id=message_id,
             match_ids=match_ids,
+            senior_match_ids=senior_match_ids or [],
+            seniors_expanded=False,
             decisions={},
         )
         s.add(session)
@@ -133,13 +156,15 @@ async def _create_session(message_id: int, match_ids: list[int]) -> None:
         _active_session_id = session.id
     _active_session_msg_id = message_id
     _active_session_match_ids = list(match_ids)
+    _active_session_senior_ids = list(senior_match_ids or [])
+    _active_session_seniors_expanded = False
     _active_session_decisions = {}
     _current_detail_match_id = None
     _boost_target_match_id = None
 
 
 async def _session_record_decision(match_id: int, icon: str) -> None:
-    """Persist a decision in memory + DB. Closes session when all decided."""
+    """Persist a decision in memory + DB. Closes session when all jobs decided."""
     global _active_session_decisions
     _active_session_decisions[match_id] = icon
     if not _active_session_id:
@@ -151,7 +176,8 @@ async def _session_record_decision(match_id: int, icon: str) -> None:
         decisions = dict(session.decisions or {})
         decisions[str(match_id)] = icon
         session.decisions = decisions
-        if all(str(mid) in decisions for mid in session.match_ids):
+        all_ids = list(session.match_ids or []) + list(session.senior_match_ids or [])
+        if all(str(mid) in decisions for mid in all_ids):
             session.closed_at = datetime.utcnow()
         await s.commit()
 
@@ -159,6 +185,7 @@ async def _session_record_decision(match_id: int, icon: str) -> None:
 async def _close_session() -> None:
     global _active_session_id, _active_session_msg_id, _active_session_match_ids
     global _active_session_decisions, _current_detail_match_id, _boost_target_match_id
+    global _active_session_senior_ids, _active_session_seniors_expanded
     if _active_session_id:
         async with AsyncSessionLocal() as s:
             session = await s.get(FindSession, _active_session_id)
@@ -168,9 +195,22 @@ async def _close_session() -> None:
     _active_session_id = None
     _active_session_msg_id = None
     _active_session_match_ids = []
+    _active_session_senior_ids = []
+    _active_session_seniors_expanded = False
     _active_session_decisions = {}
     _current_detail_match_id = None
     _boost_target_match_id = None
+
+
+async def _set_seniors_expanded(expanded: bool) -> None:
+    global _active_session_seniors_expanded
+    _active_session_seniors_expanded = expanded
+    if _active_session_id:
+        async with AsyncSessionLocal() as s:
+            session = await s.get(FindSession, _active_session_id)
+            if session:
+                session.seniors_expanded = expanded
+                await s.commit()
 
 
 # ── View builders ──────────────────────────────────────────────────────────────
@@ -184,10 +224,28 @@ async def _load_match_data(match_ids: list[int]) -> dict[int, tuple[str, str, fl
     return {m.id: (_clean(m.title or "?"), _clean(m.company or "?"), m.rule_score or 0.0) for m in rows}
 
 
-def _build_list_text(match_ids: list[int], match_data: dict, decisions: dict) -> str:
-    undecided = sum(1 for mid in match_ids if mid not in decisions)
-    header = f"Found {len(match_ids)} jobs — tap to open:" if undecided else f"{len(match_ids)} jobs — all reviewed:"
+def _build_list_text(
+    match_ids: list[int],
+    senior_ids: list[int],
+    match_data: dict,
+    decisions: dict,
+    seniors_expanded: bool,
+) -> str:
+    n_regular = len(match_ids)
+    n_senior = len(senior_ids)
+
+    if n_senior:
+        header = f"Found {n_regular} jobs + {n_senior} senior — tap to open:"
+    else:
+        undecided = sum(1 for mid in match_ids if mid not in decisions)
+        header = (
+            f"Found {n_regular} jobs — tap to open:"
+            if undecided
+            else f"{n_regular} jobs — all reviewed:"
+        )
+
     lines = [header, ""]
+
     for i, mid in enumerate(match_ids):
         title, company, score = match_data.get(mid, ("?", "?", 0.0))
         icon = decisions.get(mid)
@@ -195,17 +253,49 @@ def _build_list_text(match_ids: list[int], match_data: dict, decisions: dict) ->
             lines.append(f"{i+1}. {icon} {title[:35]} · {company[:20]}")
         else:
             lines.append(f"{i+1}. {title[:30]} · {company[:20]} · {int(score*100)}%")
+
+    if senior_ids and seniors_expanded:
+        lines += ["", "-- Senior roles --", ""]
+        for j, mid in enumerate(senior_ids):
+            title, company, score = match_data.get(mid, ("?", "?", 0.0))
+            icon = decisions.get(mid)
+            idx = n_regular + j + 1
+            if icon:
+                lines.append(f"{idx}. {icon} [S] {title[:32]} · {company[:18]}")
+            else:
+                lines.append(f"{idx}. [S] {title[:28]} · {company[:18]} · {int(score*100)}%")
+
     return "\n".join(lines)
 
 
-def _build_list_keyboard(match_ids: list[int], decisions: dict):
+def _build_list_keyboard(
+    match_ids: list[int],
+    senior_ids: list[int],
+    decisions: dict,
+    seniors_expanded: bool,
+):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = [
         InlineKeyboardButton(str(i + 1), callback_data=f"fs_detail_{mid}")
         for i, mid in enumerate(match_ids)
         if mid not in decisions
     ]
+    if seniors_expanded:
+        for j, mid in enumerate(senior_ids):
+            if mid not in decisions:
+                idx = len(match_ids) + j + 1
+                buttons.append(InlineKeyboardButton(str(idx), callback_data=f"fs_detail_{mid}"))
     rows = [buttons[i:i+4] for i in range(0, len(buttons), 4)]
+    if senior_ids:
+        if seniors_expanded:
+            rows.append([InlineKeyboardButton(
+                "📂 Collapse senior roles", callback_data="fs_collapse_seniors"
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"📁 Senior roles: {len(senior_ids)} hidden — tap to expand",
+                callback_data="fs_expand_seniors",
+            )])
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([[]])
 
 
@@ -286,7 +376,6 @@ async def _edit_session_message(text: str, keyboard=None) -> None:
     except Exception as e:
         err = str(e).lower()
         if any(kw in err for kw in ("can't be edited", "not found", "message_id_invalid", "too old")):
-            # Message is >48h old — send a fresh one and update session
             msg = await _app.bot.send_message(
                 chat_id=settings.telegram_chat_id,
                 text=text,
@@ -313,11 +402,18 @@ async def _edit_session_message(text: str, keyboard=None) -> None:
 
 async def _go_list_view() -> None:
     """Return the session message to State 1 (list view)."""
-    if not _active_session_match_ids:
+    all_ids = _active_session_match_ids + _active_session_senior_ids
+    if not all_ids:
         return
-    match_data = await _load_match_data(_active_session_match_ids)
-    text = _build_list_text(_active_session_match_ids, match_data, _active_session_decisions)
-    kb = _build_list_keyboard(_active_session_match_ids, _active_session_decisions)
+    match_data = await _load_match_data(all_ids)
+    text = _build_list_text(
+        _active_session_match_ids, _active_session_senior_ids,
+        match_data, _active_session_decisions, _active_session_seniors_expanded,
+    )
+    kb = _build_list_keyboard(
+        _active_session_match_ids, _active_session_senior_ids,
+        _active_session_decisions, _active_session_seniors_expanded,
+    )
     await _edit_session_message(text, kb)
 
 
@@ -325,7 +421,6 @@ async def _go_list_view() -> None:
 
 async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "almaty") -> None:
     from app.queue.processor import run_pipeline
-    start_ts = datetime.utcnow()
     result = await run_pipeline(location_filter=location_filter)
 
     if "error" in result:
@@ -335,42 +430,47 @@ async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "alm
         )
         return
 
-    if not result.get("enqueued"):
-        loc_tag = "" if location_filter == "almaty" else f" [{location_filter.upper()}]"
-        await bot.edit_message_text(
-            chat_id=settings.telegram_chat_id, message_id=msg_id,
-            text=f"Done{loc_tag}. Scraped {result['scraped']}, nothing new.",
-        )
-        return
-
+    # Load ALL currently waiting jobs — not just this run's jobs.
+    # The previous bug filtered by created_at >= start_ts which excluded all pre-existing waiting jobs.
     async with AsyncSessionLocal() as s:
-        new_matches = (await s.execute(
+        regular_matches = (await s.execute(
             select(Match)
             .where(
                 Match.status == "waiting",
-                Match.created_at >= start_ts,
                 Match.night_run == False,
                 Match.seniority.is_(None),
             )
             .order_by(Match.rule_score.desc())
         )).scalars().all()
 
-    if not new_matches:
+        senior_matches = (await s.execute(
+            select(Match)
+            .where(
+                Match.status == "waiting",
+                Match.night_run == False,
+                Match.seniority == "senior",
+            )
+            .order_by(Match.rule_score.desc())
+        )).scalars().all()
+
+    if not regular_matches and not senior_matches:
+        loc_tag = "" if location_filter == "almaty" else f" [{location_filter.upper()}]"
         await bot.edit_message_text(
             chat_id=settings.telegram_chat_id, message_id=msg_id,
-            text=f"Done. Scraped {result['scraped']}, nothing queued.",
+            text=f"Done{loc_tag}. Scraped {result.get('scraped', 0)}, nothing to review.",
         )
         return
 
-    match_ids = [m.id for m in new_matches]
-    await _create_session(msg_id, match_ids)
+    regular_ids = [m.id for m in regular_matches]
+    senior_ids = [m.id for m in senior_matches]
+    await _create_session(msg_id, regular_ids, senior_ids)
 
     match_data = {
         m.id: (_clean(m.title or "?"), _clean(m.company or "?"), m.rule_score or 0.0)
-        for m in new_matches
+        for m in list(regular_matches) + list(senior_matches)
     }
-    text = _build_list_text(match_ids, match_data, {})
-    kb = _build_list_keyboard(match_ids, {})
+    text = _build_list_text(regular_ids, senior_ids, match_data, {}, False)
+    kb = _build_list_keyboard(regular_ids, senior_ids, {}, False)
 
     await bot.edit_message_text(
         chat_id=settings.telegram_chat_id,
@@ -505,13 +605,12 @@ async def _boost_in_session(match_id: int, title: str, company: str) -> None:
     if pdf_bytes:
         _pending_pdfs[match_id] = pdf_bytes
 
-    # Anti-race: abort if user navigated away during generation
     if _boost_target_match_id != match_id or _app is None:
         return
 
     if not cover_text:
         await _edit_session_message(
-            f"Cover letter generation failed for {title} · {company}.\nCheck /errors.",
+            f"Cover letter generation failed for {title} · {company}.\nCheck /logs.",
             _build_back_keyboard(),
         )
         return
@@ -530,7 +629,19 @@ async def _handle_fs_back(query) -> None:
     """State 2 or 3 → State 1: return to list without recording a decision."""
     global _current_detail_match_id, _boost_target_match_id
     _current_detail_match_id = None
-    _boost_target_match_id = None  # cancel pending boost display if racing
+    _boost_target_match_id = None
+    await _go_list_view()
+
+
+async def _handle_fs_expand_seniors(query) -> None:
+    """Expand the senior roles section in the list view."""
+    await _set_seniors_expanded(True)
+    await _go_list_view()
+
+
+async def _handle_fs_collapse_seniors(query) -> None:
+    """Collapse the senior roles section in the list view."""
+    await _set_seniors_expanded(False)
     await _go_list_view()
 
 
@@ -548,7 +659,7 @@ async def _handle_fs_copy(query, match_id: int) -> None:
             text=cover_text,
         )
         asyncio.create_task(_delete_after(msg.message_id, 60))
-    await query.answer("Letter sent — copies itself after 60s", show_alert=False)
+    await query.answer("Letter sent — auto-deleted after 60s", show_alert=False)
 
 
 async def _handle_fs_send(query, match_id: int) -> None:
@@ -567,7 +678,7 @@ async def _handle_fs_send(query, match_id: int) -> None:
 
     if not cover_text:
         await _edit_session_message(
-            f"No cover letter available for {title}.\nRe-open and use Boost again.",
+            f"No cover letter for {title}.\nRe-open and use Boost again.",
             _build_back_keyboard(),
         )
         return
@@ -575,7 +686,6 @@ async def _handle_fs_send(query, match_id: int) -> None:
     pdf_bytes = _pending_pdfs.pop(match_id, None)
 
     if not handle:
-        # No direct contact — deliver PDF to user's chat for manual upload
         if pdf_bytes and _app:
             import io
             bio = io.BytesIO(pdf_bytes)
@@ -589,7 +699,7 @@ async def _handle_fs_send(query, match_id: int) -> None:
         _current_detail_match_id = None
         await _session_record_decision(match_id, "✅")
         await _go_list_view()
-        if url:
+        if url and _app:
             await _app.bot.send_message(
                 chat_id=settings.telegram_chat_id,
                 text=f"No direct recruiter contact. Apply manually:\n{url}",
@@ -611,7 +721,7 @@ async def _handle_fs_send(query, match_id: int) -> None:
 
     if not ok:
         await _edit_session_message(
-            f"Send failed to {handle}.\nCheck /errors.\n\nApply manually: {url}",
+            f"Send failed to {handle}.\nCheck /logs.\n\nApply manually: {url}",
             _build_back_keyboard(),
         )
         return
@@ -747,7 +857,7 @@ async def _boost_legacy(match_id: int, title: str, company: str) -> None:
     if not cover_text:
         await _app.bot.send_message(
             chat_id=settings.telegram_chat_id,
-            text=f"Cover letter generation failed for {title} @ {company}. Check /errors.",
+            text=f"Cover letter generation failed for {title} @ {company}. Check /logs.",
         )
         return
     await _app.bot.send_message(chat_id=settings.telegram_chat_id, text=cover_text[:4000])
@@ -803,12 +913,12 @@ async def _handle_boost_send(query, match_id: int) -> None:
     if handle.startswith("@"):
         from app.appliers.tg_sender import send_dm, send_dm_with_document
         ok = await (send_dm_with_document(handle, cover_text, pdf_bytes, filename) if pdf_bytes else send_dm(handle, cover_text))
-        result = f"DM sent to {handle}." if ok else f"DM failed to {handle}. Check /errors."
+        result = f"DM sent to {handle}." if ok else f"DM failed to {handle}. Check /logs."
     else:
         from app.appliers.email_sender import send_email, send_email_with_pdf
         subject = f"Application: {title} at {company}"
         ok = await (send_email_with_pdf(handle, subject, cover_text, pdf_bytes, filename) if pdf_bytes else send_email(handle, subject, cover_text))
-        result = f"Email sent to {handle}." if ok else f"Email failed to {handle}. Check /errors."
+        result = f"Email sent to {handle}." if ok else f"Email failed to {handle}. Check /logs."
     await _app.bot.send_message(chat_id=settings.telegram_chat_id, text=result)
     await log_event("boost_sent", f"match_id={match_id} handle={handle} ok={ok}")
 
@@ -941,25 +1051,6 @@ async def cmd_rejected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
-async def cmd_errors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    async with AsyncSessionLocal() as s:
-        events = (await s.execute(
-            select(EventLog)
-            .where(EventLog.level.in_(["WARNING", "ERROR"]))
-            .order_by(EventLog.ts.desc())
-            .limit(20)
-        )).scalars().all()
-    if not events:
-        await update.message.reply_text("No scraper errors recorded.")
-        return
-    lines = [f"Last {len(events)} scraper errors:\n"]
-    for e in reversed(events):
-        ts = e.ts.strftime("%m-%d %H:%M") if e.ts else ""
-        lines.append(f"{ts} [{e.level}] {e.detail}")
-    await update.message.reply_text("\n".join(lines))
-
-
 async def cmd_seniors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
     async with AsyncSessionLocal() as s:
@@ -969,7 +1060,7 @@ async def cmd_seniors(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not matches:
         await update.message.reply_text("No senior-tagged jobs yet.")
         return
-    lines = [f"Last {len(matches)} senior-level roles (hidden from auto-queue):\n"]
+    lines = [f"Last {len(matches)} senior-level roles:\n"]
     for m in matches:
         pub_date = (m.extra or {}).get("pub_date", "")
         line = f"[{m.source.upper()}] {_clean(m.title or '?')}"
@@ -1037,18 +1128,34 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Pipeline resumed.")
 
 
-async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
-    import os
-    path = os.environ.get("CONFIG_PATH", "/app/config.yaml")
-    if not os.path.exists(path):
-        path = "config.yaml"
-    try:
-        with open(path) as f:
-            text = f.read()
-        await update.message.reply_text(f"<pre>{html.escape(text)}</pre>", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"Config error: {e}")
+    text = (
+        "Job Agent commands\n\n"
+        "SEARCH\n"
+        "/find       Scrape Almaty jobs, open browse session\n"
+        "/findall    Scrape all Kazakhstan, open browse session\n\n"
+        "QUEUE\n"
+        "/queue      Waiting and in-flight count\n"
+        "/seniors    Senior-tagged jobs (if no active session)\n"
+        "/rejected   System-rejected close calls\n"
+        "/export     Download all matches as CSV\n\n"
+        "CV\n"
+        "/cv         CV status and tailoring\n"
+        "/setcv      Paste CV as plain text (fallback)\n\n"
+        "CONFIG\n"
+        "/settings   Toggle sources, days, max matches\n"
+        "/set        Edit a config value — e.g. /set days 3\n\n"
+        "MONITORING\n"
+        "/health     LLM providers and pipeline status\n"
+        "/stats      Application statistics\n"
+        "/logs       Recent events and errors\n\n"
+        "PIPELINE\n"
+        "/stop       Pause scraping\n"
+        "/resume     Resume scraping\n"
+        "/help       All commands"
+    )
+    await update.message.reply_text(text)
 
 
 # ── CV commands ───────────────────────────────────────────────────────────────
@@ -1113,43 +1220,6 @@ async def cmd_cv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(lines))
 
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update): return
-    text = (
-        "Job Agent commands\n\n"
-        "Search\n"
-        "/find — scrape Almaty, open browse session\n"
-        "/findall — scrape all Kazakhstan, open browse session\n\n"
-        "Browse session\n"
-        "Tap a number to open full job card\n"
-        "Approve — mark approved (Telegram/remote: auto-sends cover letter)\n"
-        "Boost — generate cover letter + tailored CV, then send\n"
-        "Skip — reject immediately\n"
-        "Back to list — return without decision\n\n"
-        "Queue\n"
-        "/queue — waiting / in-flight count\n"
-        "/seniors — senior-tagged jobs (not auto-sent)\n"
-        "/rejected — system-rejected close calls\n"
-        "/export — download all matches as CSV\n\n"
-        "CV\n"
-        "/cv — CV status + tailor button\n"
-        "/setcv — paste CV as plain text (if PDF fails)\n\n"
-        "Config\n"
-        "/settings — toggle sources / days / max\n"
-        "/set <key> <value> — edit runtime config\n"
-        "/config — show config.yaml\n\n"
-        "Monitoring\n"
-        "/stats — pipeline statistics\n"
-        "/health — LLM provider status\n"
-        "/logs — recent events\n"
-        "/errors — scraper errors\n\n"
-        "Pipeline\n"
-        "/stop — pause\n"
-        "/resume — unpause"
-    )
-    await update.message.reply_text(text)
-
-
 # ── CV upload / text-paste handlers ──────────────────────────────────────────
 
 async def handle_pdf_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1211,7 +1281,7 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await query.answer()
     data = query.data
 
-    # ── Find session (new single-message flow) ────────────────────────────────
+    # ── Find session (single-message flow) ───────────────────────────────────
     if data.startswith("fs_detail_"):
         await _ensure_session_loaded()
         await _handle_fs_detail(query, int(data[10:]))
@@ -1227,6 +1297,12 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     elif data == "fs_back":
         await _ensure_session_loaded()
         await _handle_fs_back(query)
+    elif data == "fs_expand_seniors":
+        await _ensure_session_loaded()
+        await _handle_fs_expand_seniors(query)
+    elif data == "fs_collapse_seniors":
+        await _ensure_session_loaded()
+        await _handle_fs_collapse_seniors(query)
     elif data.startswith("fs_copy_"):
         await _handle_fs_copy(query, int(data[8:]))
     elif data.startswith("fs_send_"):
@@ -1269,6 +1345,20 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await query.edit_message_reply_markup(reply_markup=settings_keyboard(current, days, max_m))
     elif data == "cfg_noop":
         pass
+    elif data == "cfg_show_config":
+        config_path = os.environ.get("CONFIG_PATH", "/app/config.yaml")
+        if not os.path.exists(config_path):
+            config_path = "config.yaml"
+        try:
+            with open(config_path) as f:
+                cfg_text = f.read()
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            back_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Back to settings", callback_data="cmd_settings")
+            ]])
+            await query.edit_message_text(cfg_text[:4000], reply_markup=back_kb)
+        except Exception as e:
+            await query.answer(f"Config read error: {e}", show_alert=True)
     elif data == "cmd_find":
         await query.edit_message_text("Starting pipeline... (Almaty)")
         asyncio.create_task(_run_pipeline_and_report(ctx.bot, query.message.message_id, location_filter="almaty"))
@@ -1295,25 +1385,23 @@ def register_handlers(app: Application) -> None:
     global _app
     _app = app
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("find",    cmd_find))
-    app.add_handler(CommandHandler("findall", cmd_findall))
-    app.add_handler(CommandHandler("queue",   cmd_queue))
-    app.add_handler(CommandHandler("stats",   cmd_stats))
-    app.add_handler(CommandHandler("health",  cmd_health))
-    app.add_handler(CommandHandler("logs",    cmd_logs))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("find",     cmd_find))
+    app.add_handler(CommandHandler("findall",  cmd_findall))
+    app.add_handler(CommandHandler("queue",    cmd_queue))
+    app.add_handler(CommandHandler("stats",    cmd_stats))
+    app.add_handler(CommandHandler("health",   cmd_health))
+    app.add_handler(CommandHandler("logs",     cmd_logs))
     app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("set",     cmd_set))
+    app.add_handler(CommandHandler("set",      cmd_set))
     app.add_handler(CommandHandler("rejected", cmd_rejected))
-    app.add_handler(CommandHandler("errors",  cmd_errors))
-    app.add_handler(CommandHandler("seniors", cmd_seniors))
-    app.add_handler(CommandHandler("export",  cmd_export))
-    app.add_handler(CommandHandler("stop",    cmd_stop))
-    app.add_handler(CommandHandler("resume",  cmd_resume))
-    app.add_handler(CommandHandler("config",  cmd_config))
-    app.add_handler(CommandHandler("cv",      cmd_cv))
-    app.add_handler(CommandHandler("setcv",   cmd_setcv))
-    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("seniors",  cmd_seniors))
+    app.add_handler(CommandHandler("export",   cmd_export))
+    app.add_handler(CommandHandler("stop",     cmd_stop))
+    app.add_handler(CommandHandler("resume",   cmd_resume))
+    app.add_handler(CommandHandler("cv",       cmd_cv))
+    app.add_handler(CommandHandler("setcv",    cmd_setcv))
+    app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CallbackQueryHandler(gate1_callback))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf_upload))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
