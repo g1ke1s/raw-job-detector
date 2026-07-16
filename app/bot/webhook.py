@@ -33,6 +33,7 @@ _active_session_msg_id: int | None = None
 _active_session_match_ids: list[int] = []           # regular jobs
 _active_session_senior_ids: list[int] = []          # senior-tagged jobs
 _active_session_seniors_expanded: bool = False
+_active_session_seniors_cleared: bool = False       # shows confirmation noop button after bulk-clear
 _active_session_decisions: dict[int, str] = {}      # match_id → icon
 _current_detail_match_id: int | None = None
 _boost_target_match_id: int | None = None
@@ -137,7 +138,7 @@ async def _create_session(
     """Close any existing session and open a new one."""
     global _active_session_id, _active_session_msg_id, _active_session_match_ids
     global _active_session_decisions, _current_detail_match_id, _boost_target_match_id
-    global _active_session_senior_ids, _active_session_seniors_expanded
+    global _active_session_senior_ids, _active_session_seniors_expanded, _active_session_seniors_cleared
     async with AsyncSessionLocal() as s:
         existing = await s.scalar(select(FindSession).where(FindSession.closed_at.is_(None)))
         if existing:
@@ -158,6 +159,7 @@ async def _create_session(
     _active_session_match_ids = list(match_ids)
     _active_session_senior_ids = list(senior_match_ids or [])
     _active_session_seniors_expanded = False
+    _active_session_seniors_cleared = False
     _active_session_decisions = {}
     _current_detail_match_id = None
     _boost_target_match_id = None
@@ -185,7 +187,7 @@ async def _session_record_decision(match_id: int, icon: str) -> None:
 async def _close_session() -> None:
     global _active_session_id, _active_session_msg_id, _active_session_match_ids
     global _active_session_decisions, _current_detail_match_id, _boost_target_match_id
-    global _active_session_senior_ids, _active_session_seniors_expanded
+    global _active_session_senior_ids, _active_session_seniors_expanded, _active_session_seniors_cleared
     if _active_session_id:
         async with AsyncSessionLocal() as s:
             session = await s.get(FindSession, _active_session_id)
@@ -197,6 +199,7 @@ async def _close_session() -> None:
     _active_session_match_ids = []
     _active_session_senior_ids = []
     _active_session_seniors_expanded = False
+    _active_session_seniors_cleared = False
     _active_session_decisions = {}
     _current_detail_match_id = None
     _boost_target_match_id = None
@@ -273,6 +276,7 @@ def _build_list_keyboard(
     senior_ids: list[int],
     decisions: dict,
     seniors_expanded: bool,
+    seniors_cleared: bool = False,
 ):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = [
@@ -287,15 +291,22 @@ def _build_list_keyboard(
                 buttons.append(InlineKeyboardButton(str(idx), callback_data=f"fs_detail_{mid}"))
     rows = [buttons[i:i+4] for i in range(0, len(buttons), 4)]
     if senior_ids:
+        clear_btn = InlineKeyboardButton("🗑 Clear all", callback_data="fs_clear_seniors")
         if seniors_expanded:
-            rows.append([InlineKeyboardButton(
-                "📂 Collapse senior roles", callback_data="fs_collapse_seniors"
-            )])
+            rows.append([
+                InlineKeyboardButton("📂 Collapse senior roles", callback_data="fs_collapse_seniors"),
+                clear_btn,
+            ])
         else:
-            rows.append([InlineKeyboardButton(
-                f"📁 Senior roles: {len(senior_ids)} hidden — tap to expand",
-                callback_data="fs_expand_seniors",
-            )])
+            rows.append([
+                InlineKeyboardButton(
+                    f"📁 Senior roles: {len(senior_ids)} hidden — tap to expand",
+                    callback_data="fs_expand_seniors",
+                ),
+                clear_btn,
+            ])
+    elif seniors_cleared:
+        rows.append([InlineKeyboardButton("✓ Senior roles cleared", callback_data="cfg_noop")])
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([[]])
 
 
@@ -413,13 +424,19 @@ async def _go_list_view() -> None:
     kb = _build_list_keyboard(
         _active_session_match_ids, _active_session_senior_ids,
         _active_session_decisions, _active_session_seniors_expanded,
+        seniors_cleared=_active_session_seniors_cleared,
     )
     await _edit_session_message(text, kb)
 
 
 # ── Pipeline runner ────────────────────────────────────────────────────────────
 
-async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "almaty") -> None:
+async def _run_pipeline_and_report(
+    bot,
+    msg_id: int,
+    location_filter: str = "almaty",
+    empty_text: str | None = None,
+) -> None:
     from app.queue.processor import run_pipeline
     result = await run_pipeline(location_filter=location_filter)
 
@@ -454,10 +471,14 @@ async def _run_pipeline_and_report(bot, msg_id: int, location_filter: str = "alm
         )).scalars().all()
 
     if not regular_matches and not senior_matches:
-        loc_tag = "" if location_filter == "almaty" else f" [{location_filter.upper()}]"
+        if empty_text:
+            text = empty_text
+        else:
+            loc_tag = "" if location_filter == "almaty" else f" [{location_filter.upper()}]"
+            text = f"Done{loc_tag}. Scraped {result.get('scraped', 0)}, nothing to review."
         await bot.edit_message_text(
             chat_id=settings.telegram_chat_id, message_id=msg_id,
-            text=f"Done{loc_tag}. Scraped {result.get('scraped', 0)}, nothing to review.",
+            text=text,
         )
         return
 
@@ -642,6 +663,49 @@ async def _handle_fs_expand_seniors(query) -> None:
 async def _handle_fs_collapse_seniors(query) -> None:
     """Collapse the senior roles section in the list view."""
     await _set_seniors_expanded(False)
+    await _go_list_view()
+
+
+async def _handle_fs_clear_seniors(query) -> None:
+    """Mark all senior-tagged jobs as rejected and remove the senior section."""
+    global _active_session_senior_ids, _active_session_seniors_expanded, _active_session_seniors_cleared
+    senior_ids = list(_active_session_senior_ids)
+    if not senior_ids:
+        await query.answer("No senior roles to clear.", show_alert=False)
+        return
+
+    async with AsyncSessionLocal() as s:
+        for mid in senior_ids:
+            match = await s.get(Match, mid)
+            if match:
+                match.status = "rejected"
+                match.updated_at = datetime.utcnow()
+                s.add(Decision(match_id=mid, verdict="rejected", reason="cleared_seniors"))
+        await s.commit()
+
+    for mid in senior_ids:
+        _active_session_decisions[mid] = "🗑"
+
+    if _active_session_id:
+        async with AsyncSessionLocal() as s:
+            session = await s.get(FindSession, _active_session_id)
+            if session:
+                decisions = dict(session.decisions or {})
+                for mid in senior_ids:
+                    decisions[str(mid)] = "🗑"
+                session.decisions = decisions
+                session.senior_match_ids = []
+                # Auto-close if all regular jobs are also decided
+                regular_ids = list(session.match_ids or [])
+                if all(str(mid) in decisions for mid in regular_ids):
+                    session.closed_at = datetime.utcnow()
+                await s.commit()
+
+    _active_session_senior_ids = []
+    _active_session_seniors_expanded = False
+    _active_session_seniors_cleared = True
+
+    await log_event("seniors_cleared", f"cleared {len(senior_ids)} senior matches")
     await _go_list_view()
 
 
@@ -1303,6 +1367,9 @@ async def gate1_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     elif data == "fs_collapse_seniors":
         await _ensure_session_loaded()
         await _handle_fs_collapse_seniors(query)
+    elif data == "fs_clear_seniors":
+        await _ensure_session_loaded()
+        await _handle_fs_clear_seniors(query)
     elif data.startswith("fs_copy_"):
         await _handle_fs_copy(query, int(data[8:]))
     elif data.startswith("fs_send_"):
