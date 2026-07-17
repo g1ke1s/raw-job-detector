@@ -26,6 +26,8 @@ async def init_db() -> None:
             "ALTER TABLE matches ADD COLUMN IF NOT EXISTS cv_tailor_json JSONB",
             "ALTER TABLE find_sessions ADD COLUMN IF NOT EXISTS senior_match_ids JSONB",
             "ALTER TABLE find_sessions ADD COLUMN IF NOT EXISTS seniors_expanded BOOLEAN DEFAULT FALSE",
+            # LinkedIn URL-encoded Cyrillic slugs exceed the old VARCHAR(128) limit
+            "ALTER TABLE all_messages ALTER COLUMN message_id TYPE VARCHAR(512)",
         ]:
             try:
                 await conn.execute(text(stmt))

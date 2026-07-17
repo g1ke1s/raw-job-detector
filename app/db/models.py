@@ -16,7 +16,7 @@ class AllMessage(Base):
 
     id = Column(Integer, primary_key=True)
     source = Column(String(32), nullable=False)
-    message_id = Column(String(128), nullable=False)
+    message_id = Column(String(512), nullable=False)
     raw_text = Column(Text)
     url = Column(Text)
     scraped_at = Column(DateTime, default=datetime.utcnow)
