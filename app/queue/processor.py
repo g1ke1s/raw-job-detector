@@ -175,103 +175,112 @@ async def run_pipeline(night_run: bool = False, location_filter: str = "almaty")
             if not message_id:
                 continue
 
-            async with AsyncSessionLocal() as s:
-                existing = await s.scalar(
-                    select(AllMessage).where(
-                        AllMessage.source == source,
-                        AllMessage.message_id == message_id,
+            # Truncate message_id so it always fits even if the column migration
+            # hasn't run yet (e.g. URL-encoded Cyrillic LinkedIn slugs can be long).
+            message_id = message_id[:512]
+
+            try:
+                async with AsyncSessionLocal() as s:
+                    existing = await s.scalar(
+                        select(AllMessage).where(
+                            AllMessage.source == source,
+                            AllMessage.message_id == message_id,
+                        )
                     )
-                )
-                if existing:
-                    continue
-                s.add(AllMessage(
-                    source=source, message_id=message_id,
-                    raw_text=item.get("raw_text") or item.get("description", ""),
-                    url=item.get("url", ""),
-                ))
-                await s.commit()
+                    if existing:
+                        continue
+                    s.add(AllMessage(
+                        source=source, message_id=message_id,
+                        raw_text=item.get("raw_text") or item.get("description", ""),
+                        url=item.get("url", ""),
+                    ))
+                    await s.commit()
 
-            if source == "telegram":
-                raw_text = item.get("raw_text", "")
-                url = item.get("url", "")
+                if source == "telegram":
+                    raw_text = item.get("raw_text", "")
+                    url = item.get("url", "")
 
-                # Location filter
-                if location_filter == "almaty":
-                    if _NON_KZ_CITIES_RE.search(raw_text) and not _KZ_OR_REMOTE_RE.search(raw_text):
+                    # Location filter
+                    if location_filter == "almaty":
+                        if _NON_KZ_CITIES_RE.search(raw_text) and not _KZ_OR_REMOTE_RE.search(raw_text):
+                            continue
+
+                    # URL dedup: one entry per Telegram post (prevents multi-role same-post duplicates)
+                    if url in seen_tg_urls:
+                        await log_event("dedup_drop", f"[tg] url seen this run: {url}", "INFO")
+                        continue
+                    async with AsyncSessionLocal() as s:
+                        url_exists = await s.scalar(
+                            select(Match.id).where(Match.url == url)
+                        ) if url else None
+                    if url_exists:
+                        await log_event("dedup_drop", f"[tg] url already in db: {url}", "INFO")
                         continue
 
-                # URL dedup: one entry per Telegram post (prevents multi-role same-post duplicates)
-                if url in seen_tg_urls:
-                    await log_event("dedup_drop", f"[tg] url seen this run: {url}", "INFO")
-                    continue
-                async with AsyncSessionLocal() as s:
-                    url_exists = await s.scalar(
-                        select(Match.id).where(Match.url == url)
-                    ) if url else None
-                if url_exists:
-                    await log_event("dedup_drop", f"[tg] url already in db: {url}", "INFO")
-                    continue
+                    from app.scrapers.telegram_classify import classify_telegram_post
+                    vacancies = await classify_telegram_post(raw_text, min_length=min_len)
+                    if not vacancies:
+                        continue
 
-                from app.scrapers.telegram_classify import classify_telegram_post
-                vacancies = await classify_telegram_post(raw_text, min_length=min_len)
-                if not vacancies:
-                    continue
+                    # Text-based cross-channel dedup on each candidate
+                    valid_vacancies = []
+                    for vac in vacancies:
+                        if await is_text_duplicate(vac.text, source):
+                            await log_event("dedup_drop", f"[tg] {vac.text[:80]}", "INFO")
+                        else:
+                            valid_vacancies.append(vac)
 
-                # Text-based cross-channel dedup on each candidate
-                valid_vacancies = []
-                for vac in vacancies:
-                    if await is_text_duplicate(vac.text, source):
-                        await log_event("dedup_drop", f"[tg] {vac.text[:80]}", "INFO")
-                    else:
-                        valid_vacancies.append(vac)
+                    if not valid_vacancies:
+                        continue
 
-                if not valid_vacancies:
-                    continue
+                    # Pick only the best-scoring vacancy per post (avoids flooding with same-post roles)
+                    best_vac = max(valid_vacancies, key=lambda v: v.rule_score)
+                    seen_tg_urls.add(url)
 
-                # Pick only the best-scoring vacancy per post (avoids flooding with same-post roles)
-                best_vac = max(valid_vacancies, key=lambda v: v.rule_score)
-                seen_tg_urls.add(url)
+                    if "llm" in best_vac.reason:
+                        llm_calls += 1
+                    handle = _extract_handle(raw_text)
+                    await _enqueue(
+                        source=source,
+                        title=best_vac.role or "Job (Telegram)",
+                        company=item.get("channel", "telegram"),
+                        url=url,
+                        description=best_vac.text[:1000],
+                        rule_score=best_vac.rule_score,
+                        low_conf=best_vac.low_conf,
+                        recruiter_handle=handle,
+                        night_run=night_run,
+                        seniority=None,
+                        job_json=item,
+                        extra={
+                            "channel": item.get("channel"),
+                            "reason": best_vac.reason,
+                            "pub_date": item.get("pub_date"),
+                        },
+                    )
+                    enqueued += 1
+                else:
+                    title = item.get("title", "")
+                    company = item.get("company", "")
+                    if await is_duplicate(company, title, source):
+                        await log_event("dedup_drop", f"[{source}] {title} @ {company}", "INFO")
+                        continue
+                    await _enqueue(
+                        source=source, title=title, company=company,
+                        url=item.get("url", ""),
+                        description=item.get("description", ""),
+                        rule_score=1.0, low_conf=False,
+                        recruiter_handle=None,
+                        night_run=night_run,
+                        seniority=item.get("seniority"),
+                        job_json=item,
+                        extra={"pub_date": item.get("pub_date")},
+                    )
+                    enqueued += 1
 
-                if "llm" in best_vac.reason:
-                    llm_calls += 1
-                handle = _extract_handle(raw_text)
-                await _enqueue(
-                    source=source,
-                    title=best_vac.role or "Job (Telegram)",
-                    company=item.get("channel", "telegram"),
-                    url=url,
-                    description=best_vac.text[:1000],
-                    rule_score=best_vac.rule_score,
-                    low_conf=best_vac.low_conf,
-                    recruiter_handle=handle,
-                    night_run=night_run,
-                    seniority=None,
-                    job_json=item,
-                    extra={
-                        "channel": item.get("channel"),
-                        "reason": best_vac.reason,
-                        "pub_date": item.get("pub_date"),
-                    },
-                )
-                enqueued += 1
-            else:
-                title = item.get("title", "")
-                company = item.get("company", "")
-                if await is_duplicate(company, title, source):
-                    await log_event("dedup_drop", f"[{source}] {title} @ {company}", "INFO")
-                    continue
-                await _enqueue(
-                    source=source, title=title, company=company,
-                    url=item.get("url", ""),
-                    description=item.get("description", ""),
-                    rule_score=1.0, low_conf=False,
-                    recruiter_handle=None,
-                    night_run=night_run,
-                    seniority=item.get("seniority"),
-                    job_json=item,
-                    extra={"pub_date": item.get("pub_date")},
-                )
-                enqueued += 1
+            except Exception as item_err:
+                log.warning("Skipping item [%s/%s]: %s", source, message_id[:80], item_err)
+                await log_event("item_skip", f"[{source}] {message_id[:80]}: {item_err}", "WARNING")
 
         async with AsyncSessionLocal() as s:
             run = await s.get(RunLog, run_id)
