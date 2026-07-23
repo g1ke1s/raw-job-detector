@@ -1,20 +1,20 @@
 """
-Rule-based title filter for hh.kz and LinkedIn.
+Job-title relevance filter for hh.kz and LinkedIn.
 Keywords loaded from DB. Senior-level titles are tagged, not dropped.
 
-Priority rules:
-  1. Strong positive signal (AI/ML/Data phrase) ALWAYS wins over exclude_hard terms.
-  2. Hard-exclude only fires when there is ZERO positive signal.
-  3. Genuinely ambiguous titles get a narrow yes/no LLM call.
+Relevance decision order:
+  1. Pre-filter A — AI-as-context false positive check (fast regex, no model).
+  2. Pre-filter B — Non-DS trainee/course false positive check (fast regex).
+  3. Semantic classifier (sentence-transformers, local, no API call):
+       confident pass  → proceed
+       hard block      → drop
+       uncertain       → LLM fallback (narrow yes/no, ~5 tokens)
+  4. LLM fallback — only for genuinely ambiguous titles.
 
-False-positive pre-filters (applied before the main priority logic):
-  A. "AI as context": non-DS primary role present AND "ai/ml" only appears as a tool
-     qualifier ("with AI", "using AI tools", "generative AI for") → drop immediately,
-     no LLM call.
-  B. "Non-DS trainee/course": non-DS primary role field AND trainee/bootcamp/course
-     signal → drop immediately.
-  Both pre-filters are guarded by has_strong_phrase=False so that real compound
-  titles ("DevOps/MLOps Engineer", "AI Engineer / Backend Dev") are never dropped.
+Seniority detection — regex only (structural, not semantic):
+  "Senior X"             → tagged senior
+  "Junior–Senior X"      → NOT tagged (junior negates the range)
+  "Staff / Principal X"  → tagged senior
 """
 from __future__ import annotations
 
@@ -104,6 +104,13 @@ _RE_COURSE_SIGNAL = re.compile(
     r")"
 )
 
+# Junior signals that negate a senior tag when they co-appear in the same title.
+# Handles "Junior–Senior", "Junior/Senior", "all levels", "all grades".
+_RE_JUNIOR = re.compile(
+    r"\bjunior\b|\bjr\.?\b|\ball\s+levels?\b|\ball\s+grades?\b",
+    re.UNICODE,
+)
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -159,66 +166,60 @@ async def title_seniority_check(title: str) -> str:
       "senior" — in-field, senior level → tag and store, skip auto-queue
       "drop"   — not in-field → discard
 
-    Pre-filters (run before main priority logic):
-      A. Non-DS primary role + AI as context qualifier → drop (no LLM call).
-      B. Non-DS primary role + trainee/course signal → drop (no LLM call).
-      Both are guarded: only fire when has_strong_phrase=False, so compound
-      titles like "DevOps/MLOps" and "AI Engineer / Backend" are never blocked.
+    Decision order:
+      1. Pre-filters A and B (fast regex, no model inference).
+      2. Semantic relevance via semantic_filter.is_relevant_role().
+      3. LLM fallback for the uncertain zone only.
 
-    Main priority:
-      • has_strong=True  → always relevant; hard terms are context (compound_keep).
-      • has_strong=False, has_hard=True  → pure irrelevant role, drop.
-      • has_strong=False, has_hard=False → LLM yes/no decides.
+    Seniority regex is applied only to titles that pass relevance.
+    Titles matching "Junior–Senior" / "all levels" ranges are NOT tagged senior.
     """
     if not title or len(title.strip()) < 3:
         return "drop"
 
     norm = _norm(title)
     from app.db.config_store import get as db_get
+
+    # ── Pre-filters: use has_strong_phrase guard to protect compound DS titles ──
+    # ("DevOps/MLOps Engineer" has "mlops" in strong_phrase → guard fires → skip pre-filter)
     all_strong = _compile(await db_get("include_strong") or [])
-    hard        = _compile(await db_get("exclude_hard") or [])
-    senior      = _compile(await db_get("senior_terms") or [])
-
-    # Split include_strong: phrases are always safe; bare abbreviations are context-sensitive.
     strong_phrase = [(t, p) for t, p in all_strong if t not in _CONTEXT_ABBREV]
-    strong_abbrev = [(t, p) for t, p in all_strong if t in _CONTEXT_ABBREV]
-
     has_strong_phrase = any(p.search(norm) for _, p in strong_phrase)
-
-    # "AI as context" — bare abbreviation suppressed when a qualifier phrase is present.
     ai_is_context = bool(_RE_AI_AS_CONTEXT.search(norm))
-    has_strong_abbrev = (not ai_is_context) and any(p.search(norm) for _, p in strong_abbrev)
 
-    has_strong = has_strong_phrase or has_strong_abbrev
-    has_hard   = any(p.search(norm) for _, p in hard)
-    is_senior  = any(p.search(norm) for _, p in senior)
-
-    # ── Pre-filter A: non-DS primary role + AI as context qualifier ─────────
-    # e.g. "Front-End Development with AI", "Android Dev using AI Tools"
+    # Pre-filter A: non-DS primary role + AI as context qualifier
     if not has_strong_phrase and ai_is_context and _RE_NON_DS.search(norm):
         from app.monitoring.events import log_event
         await log_event("filter_reject", f"[ai_context:drop] {title}", "INFO")
         return "drop"
 
-    # ── Pre-filter B: non-DS primary role + trainee/course signal ──────────
-    # e.g. "Software Functional Testing Trainee", ".NET Development Trainee with AI"
+    # Pre-filter B: non-DS primary role + trainee/course signal
     if not has_strong_phrase and _RE_NON_DS.search(norm) and _RE_COURSE_SIGNAL.search(norm):
         from app.monitoring.events import log_event
         await log_event("filter_reject", f"[nonds_course:drop] {title}", "INFO")
         return "drop"
 
-    # ── Main priority logic ────────────────────────────────────────────────
-    if has_strong:
-        if has_hard:
-            from app.monitoring.events import log_event
-            await log_event("filter_compound", f"[compound_keep] {title}", "INFO")
-    else:
-        if has_hard:
-            return "drop"
-        if not await _llm_title_check(title):
-            from app.monitoring.events import log_event
-            await log_event("filter_reject", f"[llm_classify:no] {title}", "INFO")
-            return "drop"
+    # ── Seniority detection (regex, structural — NOT semantic) ─────────────────
+    senior = _compile(await db_get("senior_terms") or [])
+    has_senior_term = any(p.search(norm) for _, p in senior)
+    # "Junior–Senior" / "all levels" range → not a senior-only role
+    is_senior = has_senior_term and not _RE_JUNIOR.search(norm)
+
+    # ── Semantic relevance classification ──────────────────────────────────────
+    from app.scrapers.semantic_filter import is_relevant_role
+    is_relevant, confidence = is_relevant_role(title)
+
+    if is_relevant is True:
+        return "senior" if is_senior else "pass"
+
+    if is_relevant is False:
+        return "drop"
+
+    # Uncertain zone → LLM fallback
+    if not await _llm_title_check(title):
+        from app.monitoring.events import log_event
+        await log_event("filter_reject", f"[llm_classify:no] {title}", "INFO")
+        return "drop"
 
     return "senior" if is_senior else "pass"
 
