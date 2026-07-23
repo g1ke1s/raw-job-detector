@@ -52,6 +52,58 @@ _STRONG_JOB_OVERRIDE = re.compile(
     re.IGNORECASE,
 )
 
+# Strong hiring intent — at least one must be present for a post to pass.
+# Matches that only trigger soft signals (@handle, bare keyword) without
+# explicit hiring intent are noise (events, pitches, news articles).
+_STRONG_HIRING_SIGNALS = [
+    # Direct vacancy / hiring language
+    re.compile(
+        r"\b(ищем|нанимаем|вакансия|открыта\s+вакансия|вакансии|"
+        r"hiring|we[\s']?re\s+hiring|looking\s+for|join\s+our\s+team)\b",
+        re.IGNORECASE,
+    ),
+    # Application instructions
+    re.compile(
+        r"\b(откликнуться|отправить\s+резюме|apply|send\s+cv|send\s+resume|"
+        r"напишите\s+нам|пишите\s+в\s+лс)\b",
+        re.IGNORECASE,
+    ),
+    # Compensation with a following number (salary: 1500, ₸500 000, $2k etc.)
+    re.compile(
+        r"(зарплата|salary|оклад|компенсация|₸|usd|eur)\s*:?\s*\d",
+        re.IGNORECASE,
+    ),
+    # Job requirements section header
+    re.compile(
+        r"\b(требования|требуется\s+опыт|requirements|experience\s+required|"
+        r"стек|tech\s+stack)\b",
+        re.IGNORECASE,
+    ),
+    # CV/resume requested alongside a contact
+    re.compile(
+        r"(резюме|cv|портфолио).{0,60}(@\w{4,}|t\.me/\w+)",
+        re.IGNORECASE | re.DOTALL,
+    ),
+]
+
+# Content types that are never job postings.  Checked AFTER _JOB_SIGNALS passes
+# to catch false positives (events mentioning ML, startup pitches, news).
+_NOISE_PATTERNS = [
+    re.compile(
+        r"\b(митап|meetup|конференция|нетворкинг|доклад|спикер|"
+        r"регистрация\s+на\s+событие)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(проект\s+участника|питч|стартап\s+ищет|мы\s+запустили|наш\s+продукт|mvp)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(статья|читайте|подробнее\s+по\s+ссылке|новость|анонс)\b",
+        re.IGNORECASE,
+    ),
+]
+
 
 def _normalize(text: str) -> str:
     return (text or "").replace("ё", "е").replace("Ё", "Е").lower()
@@ -70,6 +122,18 @@ def is_job_post(text: str, min_length: int = 20) -> tuple[bool, str]:
         return False, "ad_or_course"
     if not has_job:
         return False, "no_job_signal"
+
+    has_strong_hiring = any(p.search(norm) for p in _STRONG_HIRING_SIGNALS)
+    has_noise = any(p.search(norm) for p in _NOISE_PATTERNS)
+
+    # Event/meetup/news/pitch without clear hiring intent → not a job post
+    if has_noise and not has_strong_hiring:
+        return False, "noise_no_hiring_intent"
+
+    # Soft signals only (e.g. a lone @handle or bare keyword) → not enough
+    if not has_strong_hiring:
+        return False, "no_strong_hiring_signal"
+
     return True, "ok"
 
 

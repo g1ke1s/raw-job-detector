@@ -12,11 +12,11 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes,
 )
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete as sa_delete
 
 from app.config import settings
 from app.db.session import AsyncSessionLocal
-from app.db.models import Match, Decision, RunLog, EventLog, FindSession
+from app.db.models import AllMessage, Match, Decision, RunLog, EventLog, FindSession
 from app.bot.keyboards import main_menu_keyboard, settings_keyboard, ALL_SOURCES
 from app.monitoring.events import log_event
 from app.runtime_config import rc
@@ -1192,6 +1192,38 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Pipeline resumed.")
 
 
+async def cmd_reprocess(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update): return
+    msg = await update.message.reply_text("Counting stale filter entries...")
+    async with AsyncSessionLocal() as s:
+        # URL-based join: find AllMessages with a non-empty URL that has no
+        # Match with the same URL.  These were seen and rejected at filter stage
+        # (telegram noise/wrong-field) but never enqueued.  Safe to clear so the
+        # next /findall re-evaluates them with the improved filter.
+        matched_urls = select(Match.url).where(Match.url.isnot(None), Match.url != "")
+        count = await s.scalar(
+            select(func.count()).select_from(AllMessage).where(
+                AllMessage.url.isnot(None),
+                AllMessage.url != "",
+                AllMessage.url.not_in(matched_urls),
+            )
+        )
+        result = await s.execute(
+            sa_delete(AllMessage).where(
+                AllMessage.url.isnot(None),
+                AllMessage.url != "",
+                AllMessage.url.not_in(matched_urls),
+            )
+        )
+        await s.commit()
+        deleted = result.rowcount
+    await log_event("reprocess", f"cleared {deleted} stale all_messages (no match)")
+    await msg.edit_text(
+        f"Cleared {deleted} filter-rejected entries from all_messages.\n"
+        f"Run /findall to re-evaluate them with the updated filter."
+    )
+
+
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update): return
     text = (
@@ -1217,6 +1249,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "PIPELINE\n"
         "/stop       Pause scraping\n"
         "/resume     Resume scraping\n"
+        "/reprocess  Clear filter-rejected entries so /findall re-evaluates them\n"
         "/help       All commands"
     )
     await update.message.reply_text(text)
@@ -1464,9 +1497,10 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("rejected", cmd_rejected))
     app.add_handler(CommandHandler("seniors",  cmd_seniors))
     app.add_handler(CommandHandler("export",   cmd_export))
-    app.add_handler(CommandHandler("stop",     cmd_stop))
-    app.add_handler(CommandHandler("resume",   cmd_resume))
-    app.add_handler(CommandHandler("cv",       cmd_cv))
+    app.add_handler(CommandHandler("stop",       cmd_stop))
+    app.add_handler(CommandHandler("resume",     cmd_resume))
+    app.add_handler(CommandHandler("reprocess",  cmd_reprocess))
+    app.add_handler(CommandHandler("cv",         cmd_cv))
     app.add_handler(CommandHandler("setcv",    cmd_setcv))
     app.add_handler(CommandHandler("help",     cmd_help))
     app.add_handler(CallbackQueryHandler(gate1_callback))
